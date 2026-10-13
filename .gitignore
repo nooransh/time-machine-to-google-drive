@@ -1,4 +1,4 @@
 .DS_Store
 # Never commit secrets
-restic-password
+disk-password
 rclone.conf

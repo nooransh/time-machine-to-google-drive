@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installs tm2gdrive and its dependencies (restic, rclone) with Homebrew.
+# Installs tm2gdrive and rclone with Homebrew.
 set -e
 cd "$(dirname "$0")"
 
@@ -12,15 +12,16 @@ if ! command -v brew >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "==> Installing restic and rclone"
-brew install restic rclone
+echo "==> Installing rclone"
+brew install rclone
 
 BIN="$(brew --prefix)/bin"
 echo "==> Installing tm2gdrive to $BIN"
 install -m 755 tm2gdrive "$BIN/tm2gdrive"
 
 echo
-echo "Installed. Next steps (see README.md):"
-echo "  1. Create your Google client ID   (README: Step 2)"
-echo "  2. Give Terminal Full Disk Access  (README: Step 3)"
-echo "  3. tm2gdrive setup"
+if [[ -f "/Library/Application Support/tm2gdrive/config" ]]; then
+    echo "Updated. Apply the update to the background service with:  tm2gdrive setup"
+else
+    echo "Installed. Next: create your Google client ID (README, step 2), then run:  tm2gdrive setup"
+fi

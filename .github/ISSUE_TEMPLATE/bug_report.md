@@ -6,20 +6,20 @@ labels: bug
 
 **What happened**
 
-<!-- What you ran, what you expected, and what you saw instead. -->
+<!-- What you did, what you expected, and what happened instead. -->
 
-**Diagnostics**
+**macOS version:** <!-- e.g. 15.3 -->
 
-Output of `tm2gdrive inspect`:
-
-```
-paste here
-```
-
-The end of the latest log in `~/.config/tm2gdrive/logs/` (if the problem is during a backup):
+**Output of `tm2gdrive status`**
 
 ```
 paste here
 ```
 
-<!-- Please don't paste your encryption password or the contents of rclone.conf. -->
+**Output of `tm2gdrive logs`**
+
+```
+paste here
+```
+
+<!-- Please don't paste your disk password or anything from rclone.conf. -->
