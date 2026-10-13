@@ -112,7 +112,18 @@ shared one
 6. Open **Clients**, click **Create client**, and choose **Desktop app**.
    Keep the **Client ID** and **Client secret** for setup.
 
-### 3. Run setup
+### 3. Give your terminal Full Disk Access
+
+Open **System Settings → Privacy & Security → Full Disk Access** and turn on
+**Terminal** (or iTerm). If it isn't listed, click **+** and add it from
+**Applications → Utilities**. Then **quit the terminal (⌘Q) and open it
+again**.
+
+Why: Time Machine's **Add Backup Disk** list never offers disk images, so
+setup adds the disk with Apple's `tmutil` command. macOS only allows that
+from an app with Full Disk Access.
+
+### 4. Run setup
 
 ```bash
 tm2gdrive setup
@@ -133,9 +144,9 @@ Then it:
 - adds **Google Drive Backup** to Time Machine and offers to start the first
   backup
 
-If macOS doesn't let setup add the disk to Time Machine itself, it opens
-Time Machine settings. Click **Add Backup Disk**, choose **Google Drive
-Backup**, and leave **Encrypt Backup** off: the disk is already encrypted.
+**Google Drive Backup** then shows up in **System Settings → General → Time
+Machine**, next to any disks you already use. Don't look for it under **Add
+Backup Disk**: that list never shows disk images.
 
 ## Using it
 
@@ -159,7 +170,7 @@ tm2gdrive logs        # what the background service has been doing
 
 ## Restoring on a new Mac
 
-1. Install tm2gdrive ([steps 1–2](#setup), reusing your client ID).
+1. Install tm2gdrive ([steps 1–3](#setup), reusing your client ID).
 2. Run `tm2gdrive setup`. It finds the existing backup disk in your Drive and
    asks for the **backup disk password**.
 3. The disk appears as **Google Drive Backup**. Then either:
@@ -189,6 +200,7 @@ Start with `tm2gdrive status`, then `tm2gdrive logs`. Include both if you
 
 | Problem | Fix |
 |---|---|
+| Time Machine doesn't list "Google Drive Backup" | Give the terminal Full Disk Access ([step 3](#3-give-your-terminal-full-disk-access)), reopen it, and run `tm2gdrive setup` again. It keeps your sign-in and password. |
 | The disk isn't attached | `tm2gdrive logs` shows why. Run `tm2gdrive restart`. |
 | "Your Google sign-in has expired" or uploads fail with `invalid_grant` | Run `tm2gdrive reconnect`. If it happens weekly, publish your Google app (setup step 2.5). |
 | Uploads are stuck | Check the internet connection, then look at `tm2gdrive logs`. Unsent data stays safely in the cache. |

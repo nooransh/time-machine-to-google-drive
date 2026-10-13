@@ -67,6 +67,7 @@ export TM2GDRIVE_DRIVE_FOLDER="$DRIVE"
 export TM2GDRIVE_DISK_PASSWORD="integration-test-password"
 export TM2GDRIVE_DISK_SIZE_GB=4
 export TM2GDRIVE_ASSUME_YES=1
+export TM2GDRIVE_SKIP_FDA_CHECK=1   # CI machines grant root what Full Disk Access would
 IMAGE="$DRIVE/TimeMachine.sparsebundle"
 
 finish() {

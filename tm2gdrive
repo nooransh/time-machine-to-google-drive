@@ -218,6 +218,21 @@ tm_destination_id() {
         END { if (!done && found && id != "") print id }'
 }
 
+# Adding a Time Machine disk from the command line needs Full Disk Access for
+# the terminal app (macOS privacy protection, which applies even to root).
+has_full_disk_access() {
+    [[ -n "$TM2GDRIVE_SKIP_FDA_CHECK" ]] && return 0
+    if [[ $EUID -eq 0 ]]; then
+        ls "/Library/Application Support/com.apple.TCC" >/dev/null 2>&1
+    else
+        ls "$HOME/Library/Application Support/com.apple.TCC" >/dev/null 2>&1
+    fi
+}
+
+FDA_HELP="Open System Settings > Privacy & Security > Full Disk Access and turn it on for
+    your terminal app (Terminal or iTerm). Then quit the terminal (Cmd-Q), open it
+    again and run: $PROG setup"
+
 wait_for() {   # wait_for <seconds> <command...>
     local t="$1" _
     shift
@@ -286,7 +301,7 @@ mount_drive() {
     mkdir -p "$DRIVE_MNT"
     # "hard": if rclone restarts, I/O waits for it instead of failing, so the
     # disk image on top never sees errors. "locallocks": rclone has no NFS lock daemon.
-    if mount -t nfs -o "port=$NFS_PORT,mountport=$NFS_PORT,tcp,vers=3,locallocks,hard,intr" \
+    if mount -t nfs -o "port=$NFS_PORT,mountport=$NFS_PORT,tcp,vers=3,locallocks,hard,intr,nobrowse" \
         "127.0.0.1:/" "$DRIVE_MNT"; then
         log "mounted the Google Drive folder at $DRIVE_MNT"
     else
@@ -456,6 +471,13 @@ cmd_setup() {
     echo "${C_BLD}$PROG setup${C_OFF}: Time Machine backups to Google Drive"
     echo
 
+    if ! has_full_disk_access; then
+        err "Your terminal app needs Full Disk Access, so $PROG can add the backup disk to Time Machine."
+        echo "    $FDA_HELP"
+        open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
+        exit 1
+    fi
+
     if ! command -v rclone >/dev/null 2>&1; then
         command -v brew >/dev/null 2>&1 || die "Install Homebrew (https://brew.sh), then run: brew install rclone"
         info "Installing rclone..."
@@ -494,7 +516,7 @@ cmd_setup() {
     local envs=() v rc
     for v in TM2GDRIVE_STATE_DIR TM2GDRIVE_CACHE_DIR TM2GDRIVE_DRIVE_MNT TM2GDRIVE_LOG TM2GDRIVE_PLIST \
              TM2GDRIVE_DISK_PASSWORD TM2GDRIVE_DISK_SIZE_GB TM2GDRIVE_DRIVE_FOLDER TM2GDRIVE_ASSUME_YES \
-             TM2GDRIVE_SKIP_TIME_MACHINE; do
+             TM2GDRIVE_SKIP_TIME_MACHINE TM2GDRIVE_SKIP_FDA_CHECK; do
         [[ -n "${!v:-}" ]] && envs+=("$v=${!v}")
     done
     sudo env ${envs[@]+"${envs[@]}"} /bin/bash "$0" _setup-root "$conf"
@@ -619,16 +641,25 @@ cmd_setup_root() {
         :
     elif [[ -n "$(tm_destination_id)" ]]; then
         ok "Time Machine already backs up to \"$VOLUME_NAME\""
-    elif tmutil setdestination -a "$VOLUME" 2>/dev/null; then
-        tmutil enable 2>/dev/null
-        tmutil addexclusion -p "$CACHE_DIR" 2>/dev/null
-        ok "Time Machine now backs up to \"$VOLUME_NAME\" every hour"
     else
-        warn "macOS didn't let $PROG pick the backup disk for you. One click left:"
-        echo "    In the Time Machine settings that just opened, click \"Add Backup Disk\" (or +),"
-        echo "    choose \"$VOLUME_NAME\" and click \"Set Up Disk\". Leave \"Encrypt Backup\" off:"
-        echo "    the disk is already encrypted."
-        open "x-apple.systempreferences:com.apple.Time-Machine-Settings.extension" 2>/dev/null
+        # Time Machine's "Add Backup Disk" list never shows disk images, so
+        # this has to work from the command line.
+        local tm_err
+        if tm_err=$(tmutil setdestination -a "$VOLUME" 2>&1); then
+            tmutil enable 2>/dev/null
+            tmutil addexclusion -p "$CACHE_DIR" 2>/dev/null
+            ok "Time Machine now backs up to \"$VOLUME_NAME\" every hour"
+        else
+            err "Time Machine did not accept \"$VOLUME_NAME\": ${tm_err:-no reason given}"
+            if [[ "$tm_err" == *"Full Disk Access"* ]] || ! has_full_disk_access; then
+                echo "    $FDA_HELP"
+                open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
+            else
+                echo "    The backup disk itself is ready. Please report this message at"
+                echo "    https://github.com/nooranshdhaka/time-machine-to-google-drive/issues"
+            fi
+            exit 1
+        fi
     fi
 
     echo
