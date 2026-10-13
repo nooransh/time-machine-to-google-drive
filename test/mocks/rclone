@@ -1,0 +1,9 @@
+#!/bin/bash
+# Wrapper around the real rclone that can simulate Google's daily upload cap:
+# if $FAKE_ROOT/quota-once exists, the first "restic backup" fails like Drive does.
+if [[ "$1 $2" == "serve restic" && -f "$FAKE_ROOT/quota-once" ]] && ps -o args= -p "$PPID" | grep -q " backup "; then
+    rm -f "$FAKE_ROOT/quota-once"
+    echo "ERROR : Google drive root 'x': Received upload limit error: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded" >&2
+    exit 1
+fi
+exec "$REAL_RCLONE" "$@"

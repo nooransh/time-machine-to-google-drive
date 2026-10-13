@@ -1,0 +1,12 @@
+#!/bin/bash
+# Wrapper around the real restic that can simulate the Time Machine disk
+# disappearing mid-upload: if $FAKE_ROOT/vanish exists, a backup runs, then the
+# mounted snapshot is yanked and restic reports unreadable files (exit code 3).
+if [[ -f "$FAKE_ROOT/vanish" && " $* " == *" backup "* ]]; then
+    rm -f "$FAKE_ROOT/vanish"
+    "$REAL_RESTIC" "$@"
+    mnt="$TM2GDRIVE_MOUNT_POINT"
+    [[ -L "$mnt" ]] && rm "$mnt" && mkdir "$mnt"
+    exit 3
+fi
+exec "$REAL_RESTIC" "$@"

@@ -1,0 +1,4 @@
+#!/bin/bash
+mnt="${*: -1}"
+[[ -L "$mnt" ]] || exit 1
+rm "$mnt" && mkdir "$mnt"

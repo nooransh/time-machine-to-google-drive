@@ -1,0 +1,26 @@
+#!/bin/bash
+case "$1 $2" in
+    "info "*)
+        echo "   Device Identifier:         disk9s1"
+        echo "   Device Node:               /dev/disk9s1"
+        if [[ "$FAKE_FS" == "hfs" ]]; then
+            echo "   Type (Bundle):             hfs"
+        else
+            echo "   Type (Bundle):             apfs"
+        fi
+        ;;
+    "apfs listSnapshots")
+        [[ "$FAKE_FS" == "hfs" ]] && { echo "Error: not APFS" >&2; exit 1; }
+        n=$(find "$FAKE_ROOT/snapshots" -mindepth 1 -maxdepth 1 | wc -l | tr -d " ")
+        echo "Snapshots for disk9s1 ($n found)"
+        echo "|"
+        for s in "$FAKE_ROOT"/snapshots/*; do
+            echo "+-- 6C5B0000-0000-0000-0000-000000000000"
+            echo "|   Name:        $(basename "$s")"
+            echo "|   XID:         1234"
+            echo "|   Purgeable:   No"
+        done
+        ;;
+    "unmount force") exec "$(dirname "$0")/umount" "$3" ;;
+    *) echo "fake diskutil: unsupported $*" >&2; exit 1 ;;
+esac

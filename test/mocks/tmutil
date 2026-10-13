@@ -1,0 +1,23 @@
+#!/bin/bash
+# Fake tmutil for tests. Backups live in $FAKE_ROOT/snapshots/com.apple.TimeMachine.<date>.backup
+case "$1" in
+    destinationinfo)
+        echo "===================================================="
+        echo "Name          : FakeTM"
+        echo "Kind          : Local"
+        echo "Mount Point   : $FAKE_ROOT/tmdisk"
+        echo "ID            : 00000000-0000-0000-0000-000000000000"
+        ;;
+    listbackups)
+        for s in "$FAKE_ROOT"/snapshots/com.apple.TimeMachine.*.backup; do
+            [[ -e "$s" ]] || continue
+            d=$(basename "$s" | sed -e 's/com.apple.TimeMachine.//' -e 's/.backup$//')
+            if [[ "$FAKE_FS" == "hfs" ]]; then
+                echo "$FAKE_ROOT/tmdisk/Backups.backupdb/FakeMac/$d"
+            else
+                echo "/Volumes/.timemachine/0000-UUID/$d.backup/$d.backup"
+            fi
+        done
+        ;;
+    *) echo "fake tmutil: unsupported $*" >&2; exit 1 ;;
+esac
