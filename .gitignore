@@ -1,0 +1,4 @@
+.DS_Store
+# Never commit secrets
+restic-password
+rclone.conf
