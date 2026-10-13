@@ -13,5 +13,6 @@ First release.
 - Resumable, safe against concurrent runs, and drops incomplete snapshots if
   the backup disk disappears mid-upload.
 - Guided `setup` (own Google OAuth client, generated encryption password,
-  reconnecting to an existing backup on a new Mac), plus `status`, `restore`,
+  reconnecting to an existing backup on a new Mac), plus `status`, `restore`, `reconnect`,
   `verify`, `snapshots`, `inspect` and a `restic` passthrough.
+- Privacy policy (`PRIVACY.md`) for publishing your Google OAuth app.

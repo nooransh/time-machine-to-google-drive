@@ -203,6 +203,11 @@ check "an empty Time Machine disk is reported" contains "$out" "No Time Machine 
 out=$(run backup --dest "$FAKE_ROOT/not-there")
 check "a missing --dest disk is reported" contains "$out" "Time Machine disk not found"
 
+touch "$FAKE_ROOT/expired"
+out=$(run status)
+check "an expired Google sign-in says how to reconnect" contains "$out" "Your Google sign-in has expired. Run \"tm2gdrive reconnect\""
+rm "$FAKE_ROOT/expired"
+
 mv "$TM2GDRIVE_CONFIG_DIR/rclone.conf" "$FAKE_ROOT/rc"
 out=$(run status)
 check "commands ask for setup when not set up" contains "$out" "Not set up yet"

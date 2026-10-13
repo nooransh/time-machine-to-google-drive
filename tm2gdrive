@@ -356,14 +356,22 @@ repo_status() {
 }
 
 check_repo() {
-    repo_status
-    case $? in
+    local out rc
+    out=$(restic_cmd cat config 2>&1 >/dev/null)
+    rc=$?
+    case $rc in
         0)  ;;
         12) die "Wrong encryption password in $PASSWORD_FILE." ;;
         10) die "No backup found in Google Drive folder \"$DRIVE_FOLDER\". Run \"$PROG setup\"." ;;
-        *)  die "Cannot open the backup on Google Drive. Check your internet connection, or run \"$PROG setup\" to reconnect." ;;
+        *)  printf '%s\n' "$out" | grep -qiE "$LOGIN_EXPIRED_RE" && die "$LOGIN_EXPIRED_MSG"
+            die "Cannot open the backup on Google Drive. Check your internet connection and try again." ;;
     esac
 }
+
+# Google refresh tokens die after 7 days while the OAuth app is in "Testing".
+LOGIN_EXPIRED_RE="invalid_grant|Token has been expired or revoked"
+LOGIN_EXPIRED_MSG="Your Google sign-in has expired. Run \"$PROG reconnect\" (as your normal user), then run the command again.
+    If this happens every week, your Google Cloud app is still in Testing: see \"Publishing the app\" in README.md."
 
 # Does the Drive folder already hold a backup? (Works without the password.)
 repo_exists() {
@@ -796,6 +804,8 @@ cmd_backup() {
                 exit 130
             elif [[ $status -eq 12 ]]; then
                 die "Wrong encryption password in $PASSWORD_FILE."
+            elif grep -qiE "$LOGIN_EXPIRED_RE" "$errfile" 2>/dev/null; then
+                die "$LOGIN_EXPIRED_MSG"
             elif grep -q "storageQuotaExceeded" "$errfile" 2>/dev/null; then
                 die "Google Drive is full. Free up space or upgrade your plan, then run \"$PROG backup\" to continue."
             elif grep -qiE "upload limit error|User rate limit exceeded|quotaExceeded" "$errfile" 2>/dev/null; then
@@ -876,6 +886,17 @@ cmd_restore() {
     restic_cmd restore "$id" --target "$target" "$@"
 }
 
+cmd_reconnect() {
+    [[ $# -eq 0 ]] || die "reconnect takes no options."
+    [[ $EUID -eq 0 && -n "$SUDO_USER" ]] && die "Run reconnect as your normal user, without sudo."
+    require_tools; load_config; require_setup
+    info "A browser window will open. Sign in with the Google account that holds the backup."
+    rclone config reconnect "${RCLONE_REMOTE}:" || die "Reconnecting to Google Drive failed."
+    chmod 600 "$RCLONE_CONF"
+    rclone lsd "${RCLONE_REMOTE}:" >/dev/null 2>&1 || die "Still cannot reach Google Drive."
+    ok "Google Drive reconnected."
+}
+
 cmd_restic() {
     [[ $# -gt 0 ]] || die "Usage: $PROG restic <restic command> [args]   e.g. $PROG restic stats"
     require_tools; load_config; require_setup
@@ -903,6 +924,7 @@ Commands:
   verify [AMOUNT]         Download and check part of the backup (default 10G; e.g. 5%, 100%)
   snapshots               List the backups stored on Google Drive
   restore WHICH DIR       Restore a backup (a date or "latest") into DIR
+  reconnect               Sign in to Google again (if the sign-in expired)
   restic ARGS...          Run any restic command on the Google Drive backup
   inspect                 Print diagnostics (include this when reporting a problem)
   version                 Print the version
@@ -917,6 +939,7 @@ main() {
     [[ $# -gt 0 ]] && shift
     case "$cmd" in
         setup)               cmd_setup "$@" ;;
+        reconnect)           cmd_reconnect "$@" ;;
         status|backup|verify|snapshots|restore|restic|inspect)
             # Everything that touches the backup runs as root, so the restic cache
             # and Time Machine access are the same for every command.

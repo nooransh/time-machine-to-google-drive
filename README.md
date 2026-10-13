@@ -33,6 +33,7 @@ deduplicating backups, and [rclone](https://rclone.org) handles Google Drive.
 - [Setup](#setup)
 - [Uploading](#uploading)
 - [Restoring](#restoring)
+- [Privacy](PRIVACY.md)
 - [Settings](#settings)
 - [Troubleshooting](#troubleshooting)
 - [How it works](#how-it-works)
@@ -100,14 +101,35 @@ and is heavily rate-limited anyway.
    scopes*, paste `https://www.googleapis.com/auth/drive.file`, click **Add to
    table**, then **Update** and **Save**. This scope lets the app see only the
    files it creates, not the rest of your Drive.
-6. **External only:** open **Audience** and click **Publish app**. If you
-   skip this, Google signs the app out every 7 days and uploads stop.
-   - If the button is greyed out, first fill in **Branding → App home page**
-     and **Privacy policy link**. This repository's URL is fine for both.
-   - Google's app verification isn't needed. You'll click through an
-     "unverified app" warning once, during setup.
+6. **External only:** publish the app (see [Publishing the app](#publishing-the-app)
+   below). If you skip this, Google signs the app out every 7 days and you
+   have to run `tm2gdrive reconnect` each week.
 7. Open **Clients**, click **Create client**, choose **Desktop app**, and click
    **Create**. Keep the **Client ID** and **Client secret** for the next steps.
+
+#### Publishing the app
+
+Google only lets an External app leave "Testing" once its branding page has a
+home page and a privacy policy. This repository provides both:
+
+1. Open **Branding** and fill in:
+   - **Application home page:** `https://github.com/nooranshdhaka/time-machine-to-google-drive`
+   - **Application privacy policy link:** `https://github.com/nooranshdhaka/time-machine-to-google-drive/blob/main/PRIVACY.md`
+   - **Authorized domains:** `github.com`
+   - Leave the **App logo** empty. Uploading a logo makes Google require
+     verification before the app can be used.
+
+   Click **Save**.
+2. Open **Audience**, click **Publish app**, and confirm. The status changes to
+   **In production**.
+
+Google's verification isn't needed for personal use: you'll just click
+through an "unverified app" warning once, during setup. If you fork this
+project, use your fork's URLs, or your own website and privacy page.
+
+If you would rather not publish, the app still works in Testing. Add yourself
+under **Audience → Test users** and run `tm2gdrive reconnect` whenever
+tm2gdrive says your Google sign-in has expired (every 7 days).
 
 ### 3. Give your terminal Full Disk Access
 
@@ -242,7 +264,7 @@ Include its output if you open an issue.
 | "Several Time Machine disks are mounted" | Pass `--dest`, or set `TM_DEST` in the settings. |
 | Network Time Machine (NAS / Time Capsule) | Mount the backup first, e.g. by starting a Time Machine backup, so it appears as `/Volumes/Backups of …`. Then use `--dest "/Volumes/Backups of …"`. |
 | "Google Drive is full" | Free up space or upgrade your plan, then run `tm2gdrive backup` again. |
-| Google sign-in expires after a week | The app is still in "Testing": publish it ([step 2.6](#2-create-a-google-client-id-free-5-minutes)), then run `RCLONE_CONFIG=~/.config/tm2gdrive/rclone.conf rclone config reconnect gdrive:` |
+| "Your Google sign-in has expired" | Run `tm2gdrive reconnect`, then run your command again. If it happens weekly, [publish the app](#publishing-the-app). |
 | "repository is already locked" | Locks left by a crash are cleared automatically. If one remains and nothing is running: `tm2gdrive restic unlock --remove-all` |
 
 ## How it works
