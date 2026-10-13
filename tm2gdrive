@@ -220,13 +220,18 @@ tm_destination_id() {
 
 # Adding a Time Machine disk from the command line needs Full Disk Access for
 # the terminal app (macOS privacy protection, which applies even to root).
+# This is a best guess (macOS has no API for it): it tries folders that only
+# apps with Full Disk Access can list. Unknown counts as yes; tmutil decides.
 has_full_disk_access() {
     [[ -n "$TM2GDRIVE_SKIP_FDA_CHECK" ]] && return 0
-    if [[ $EUID -eq 0 ]]; then
-        ls "/Library/Application Support/com.apple.TCC" >/dev/null 2>&1
-    else
-        ls "$HOME/Library/Application Support/com.apple.TCC" >/dev/null 2>&1
-    fi
+    local home="$HOME" dir tried=""
+    [[ -n "$SUDO_USER" ]] && home=$(eval echo "~$SUDO_USER")
+    for dir in "$home/Library/Safari" "$home/Library/Mail" "$home/Library/Application Support/com.apple.TCC"; do
+        [[ -e "$dir" ]] || continue
+        tried=1
+        ls "$dir" >/dev/null 2>&1 && return 0
+    done
+    [[ -z "$tried" ]]
 }
 
 FDA_HELP="Open System Settings > Privacy & Security > Full Disk Access and turn it on for
@@ -472,10 +477,9 @@ cmd_setup() {
     echo
 
     if ! has_full_disk_access; then
-        err "Your terminal app needs Full Disk Access, so $PROG can add the backup disk to Time Machine."
-        echo "    $FDA_HELP"
-        open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
-        exit 1
+        warn "Your terminal app may not have Full Disk Access. Time Machine needs it to accept the backup disk."
+        echo "    If setup fails at the Time Machine step: $FDA_HELP"
+        echo
     fi
 
     if ! command -v rclone >/dev/null 2>&1; then
@@ -651,13 +655,11 @@ cmd_setup_root() {
             ok "Time Machine now backs up to \"$VOLUME_NAME\" every hour"
         else
             err "Time Machine did not accept \"$VOLUME_NAME\": ${tm_err:-no reason given}"
-            if [[ "$tm_err" == *"Full Disk Access"* ]] || ! has_full_disk_access; then
-                echo "    $FDA_HELP"
-                open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
-            else
-                echo "    The backup disk itself is ready. Please report this message at"
-                echo "    https://github.com/nooranshdhaka/time-machine-to-google-drive/issues"
-            fi
+            echo "    The backup disk itself is ready. The usual cause is missing Full Disk Access:"
+            echo "    $FDA_HELP"
+            echo "    If it is on and this keeps happening, please report the message at"
+            echo "    https://github.com/nooranshdhaka/time-machine-to-google-drive/issues"
+            open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
             exit 1
         fi
     fi
