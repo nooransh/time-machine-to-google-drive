@@ -147,6 +147,16 @@ out=$(run inspect)
 check "inspect finds the backups" contains "$out" "2025-01-04-100000"
 check "inspect shows the backup contents" contains "$out" "Macintosh HD - Data"
 
+# A running backup has a snapshot mounted; inspect must not touch it.
+mkdir -p "$FAKE_ROOT/mnt"
+"$HERE/mocks/mount_apfs" -s com.apple.TimeMachine.2025-01-03-100000.backup /dev/disk9s1 "$FAKE_ROOT/mnt"
+run inspect >/dev/null
+check "inspect leaves a running backup's mount alone" test -L "$FAKE_ROOT/mnt"
+"$HERE/mocks/umount" "$FAKE_ROOT/mnt"
+
+out=$(run restic forget --tag tm2gdrive --group-by host --keep-last 1 --dry-run)
+check "the README's retention command (--group-by host) thins backups" contains "$out" "remove 3 snapshots"
+
 # ---------------------------------------------------------------------------
 echo "Backup selection options"
 new_env apfs
@@ -185,16 +195,49 @@ mkdir "$TM2GDRIVE_CONFIG_DIR/.backup.lock"; echo "$sleeper" > "$TM2GDRIVE_CONFIG
 out=$(run backup)
 check "a second backup run at the same time is refused" contains "$out" "already running"
 kill "$sleeper"; wait "$sleeper" 2>/dev/null
+rm "$TM2GDRIVE_CONFIG_DIR/.backup.lock/pid"
+out=$(run backup)
+check "a lock that is still being created is respected" contains "$out" "starting right now"
+echo 999999 > "$TM2GDRIVE_CONFIG_DIR/.backup.lock/pid"
 out=$(run backup)
 check "a stale lock from a crashed run is ignored" contains "$out" "Finished: 1 backup(s) uploaded."
+check "the lock is gone afterwards" test ! -e "$TM2GDRIVE_CONFIG_DIR/.backup.lock"
+
+echo z > "$FAKE_ROOT/mac/a"; make_backup 2025-03-01-200000
+run backup > "$FAKE_ROOT/race1" 2>&1 &
+first=$!
+run backup > "$FAKE_ROOT/race2" 2>&1
+wait "$first"
+check "two backups started together upload a backup only once" \
+    test "$(run snapshots --json | grep -o '"tm:2025-03-01-200000"' | grep -c .)" -eq 1
 
 echo b > "$FAKE_ROOT/mac/a"; make_backup 2025-03-02-100000
 touch "$FAKE_ROOT/vanish"
 out=$(run backup)
 check "a disk that disappears mid-upload is reported" contains "$out" "stopped responding during the upload"
-check "the incomplete snapshot is not kept" lacks "$(run snapshots)" "tm:2025-03-02-100000"
+check "that backup is not counted as uploaded" contains "$(run status)" "2025-03-02-100000  incomplete"
 out=$(run backup)
 check "the backup is redone on the next run" contains "$out" "Finished: 1 backup(s) uploaded."
+check "the incomplete attempt is removed" lacks "$(run snapshots)" "tm2gdrive-incomplete"
+
+echo c > "$FAKE_ROOT/mac/a"; make_backup 2025-03-03-100000
+touch "$FAKE_ROOT/unreadable"
+out=$(run backup)
+check "unreadable files are reported" contains "$out" "some files could not be read"
+check "the run summary mentions it" contains "$out" "1 with unreadable files (retried next run)"
+check "status shows the backup as incomplete" contains "$(run status)" "2025-03-03-100000  incomplete"
+out=$(run backup)
+check "a backup with unreadable files is retried" contains "$out" "Finished: 1 backup(s) uploaded."
+check "once complete, the incomplete copy is dropped" test "$(run snapshots --json | grep -o '"tm:2025-03-03-100000"' | grep -c .)" -eq 1
+check "status then shows it as uploaded" contains "$(run status)" "2025-03-03-100000  uploaded"
+
+# Snapshot contents directly at the snapshot root: a vanished disk leaves an empty mount folder.
+mkdir -p "$FAKE_ROOT/snapshots/com.apple.TimeMachine.2025-03-04-100000.backup/Macintosh HD - Data"
+echo d > "$FAKE_ROOT/snapshots/com.apple.TimeMachine.2025-03-04-100000.backup/Macintosh HD - Data/a"
+touch "$FAKE_ROOT/vanish"
+out=$(run backup)
+check "a vanished disk is caught even when an empty mount folder remains" contains "$out" "stopped responding during the upload"
+run backup >/dev/null
 
 rm -rf "$FAKE_ROOT/snapshots"/*
 out=$(run backup)
@@ -234,13 +277,17 @@ check "status estimates the first upload time" contains "$out" "A full first upl
 out=$(run backup)
 check "uploads work with the daily speed cap on" contains "$out" "Upload speed capped at 680 GiB/day"
 check "the capped upload finishes" contains "$out" "Finished: 1 backup(s) uploaded."
+cp "$TM2GDRIVE_CONFIG_DIR/config" "$FAKE_ROOT/config.good"
 echo 'DAILY_UPLOAD_GB=lots' >> "$TM2GDRIVE_CONFIG_DIR/config"
 out=$(run status)
 check "non-numeric numbers are rejected" contains "$out" "DAILY_UPLOAD_GB in"
-# shellcheck disable=SC2016  # the $(...) must reach the file unexpanded
-echo 'TM_DEST=$(touch /tmp/tm2gdrive-pwned)' >> "$TM2GDRIVE_CONFIG_DIR/config"
-run status >/dev/null
-check "the settings file is never executed" test ! -e /tmp/tm2gdrive-pwned
+cp "$FAKE_ROOT/config.good" "$TM2GDRIVE_CONFIG_DIR/config"
+rm -f "$FAKE_ROOT/pwned"
+# shellcheck disable=SC2016  # the $(...) and backticks must reach the file unexpanded
+printf '%s\n' "MACHINE_NAME=\"\`touch $FAKE_ROOT/pwned\`\"" "TM_DEST=\$(touch $FAKE_ROOT/pwned)" >> "$TM2GDRIVE_CONFIG_DIR/config"
+out=$(run status)
+check "the settings file is never executed" test ! -e "$FAKE_ROOT/pwned"
+check "the injected value is used as plain text" contains "$out" "touch $FAKE_ROOT/pwned"
 
 # ---------------------------------------------------------------------------
 echo "Setup"
@@ -252,6 +299,8 @@ check "the password file is private" test -z "$(find "$TM2GDRIVE_CONFIG_DIR/rest
 check "setup keeps existing settings" contains "$(cat "$TM2GDRIVE_CONFIG_DIR/config")" "$FAKE_ROOT/drive/backup"
 out=$(env -u SUDO_USER "$TOOL" setup 2>&1 </dev/null)
 check "running setup again is safe" contains "$out" "Using the existing backup"
+out=$(env -u SUDO_USER "$TOOL" setup --full-drive-access 2>&1 </dev/null)
+check "--full-drive-access upgrades an existing connection" contains "$(cat "$FAKE_ROOT/rclone-update.log" 2>/dev/null)" "config update gdrive scope=drive"
 
 echo a > "$FAKE_ROOT/mac/a"; make_backup 2025-05-01-100000
 run backup >/dev/null

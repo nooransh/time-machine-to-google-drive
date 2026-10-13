@@ -248,8 +248,12 @@ default. To thin it out with restic's retention rules, for example daily
 backups for 30 days, weekly for a year and monthly forever:
 
 ```bash
-tm2gdrive restic forget --tag tm2gdrive --keep-daily 30 --keep-weekly 52 --keep-monthly 1000 --prune
+tm2gdrive restic forget --tag tm2gdrive --group-by host --keep-daily 30 --keep-weekly 52 --keep-monthly 1000 --prune
 ```
+
+Keep `--group-by host`: each backup is stored under a path that contains its
+date, and without this option restic treats every backup as its own group and
+removes nothing. Add `--dry-run` first to see what would be removed.
 
 ## Troubleshooting
 
@@ -308,7 +312,8 @@ macOS:
 sudo -E bash test/run-tests.sh
 ```
 
-`test/integration-macos.sh` goes further on a Mac. It makes a real Time
+`test/integration-macos.sh` goes further, on a **disposable** Mac (it changes
+the machine's Time Machine settings, so it refuses to run outside CI). It makes a real Time
 Machine backup onto a disk image, runs `tm2gdrive` against it with the real
 macOS tools, restores the result and compares it with the original. CI runs
 both, plus [ShellCheck](https://www.shellcheck.net), on every push.

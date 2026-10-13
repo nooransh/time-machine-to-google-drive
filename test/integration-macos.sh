@@ -2,6 +2,10 @@
 #
 # Real-world integration test (macOS only, run as root; used by CI).
 #
+# WARNING: this reconfigures Time Machine on the machine it runs on (backup
+# destination, exclusions). It only runs on disposable CI machines, or when
+# TM2GDRIVE_DESTRUCTIVE_OK=1 is set. Never run it on a Mac you rely on.
+#
 # Makes a real Time Machine backup onto an APFS disk image, then runs tm2gdrive
 # against it with real tmutil / diskutil / mount_apfs. A local folder stands in
 # for Google Drive. Finally restores the backup and compares the files.
@@ -15,6 +19,14 @@ TOOL="$HERE/../tm2gdrive"
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "macOS only" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || { echo "Run as root: sudo -E bash $0" >&2; exit 1; }
+if [[ "${CI:-}" != "true" && "${TM2GDRIVE_DESTRUCTIVE_OK:-}" != "1" ]]; then
+    echo "Refusing to run: this test reconfigures Time Machine. It is meant for disposable CI machines." >&2
+    exit 1
+fi
+if tmutil destinationinfo 2>/dev/null | grep -q '^ID' && [[ "${TM2GDRIVE_DESTRUCTIVE_OK:-}" != "1" ]]; then
+    echo "Refusing to run: this machine already has a Time Machine destination." >&2
+    exit 1
+fi
 
 step() { printf '\n=== %s\n' "$*"; }
 
@@ -23,9 +35,15 @@ VOL="TM2GDRIVE-IT"
 DEST="/Volumes/$VOL"
 DATA_DIR="/Users/Shared/tm2gdrive-it"
 
+DEST_ID=""
+EXCLUDED=()
 cleanup() {
-    tmutil disable >/dev/null 2>&1 || true
-    tmutil removedestination "$(tmutil destinationinfo | awk -F': ' '/^ID/ { print $2; exit }')" >/dev/null 2>&1 || true
+    # Undo only what this test changed.
+    local p
+    for p in ${EXCLUDED[@]+"${EXCLUDED[@]}"}; do
+        tmutil removeexclusion -p "$p" >/dev/null 2>&1 || true
+    done
+    [[ -n "$DEST_ID" ]] && { tmutil removedestination "$DEST_ID" >/dev/null 2>&1 || true; }
     umount "$WORK/mnt" >/dev/null 2>&1 || true
     hdiutil detach "$DEST" -force >/dev/null 2>&1 || true
 }
@@ -40,11 +58,17 @@ ls -l "$DATA_DIR"
 step "APFS disk image as the Time Machine disk"
 hdiutil create -size 8g -fs APFS -volname "$VOL" -type SPARSE "$WORK/tm"
 hdiutil attach "$WORK/tm.sparseimage"
-tmutil setdestination "$DEST"
+tmutil setdestination -a "$DEST"
 tmutil destinationinfo
+DEST_ID=$(tmutil destinationinfo | awk -v m="$DEST" '
+    /^ID/ { id = $3 } /^Mount Point/ { sub(/^Mount Point *: */, ""); if ($0 == m) found = 1 }
+    /^====/ { if (found) { print id; exit } found = 0 } END { if (found) print id }')
+echo "test destination ID: $DEST_ID"
 
 step "Exclude everything except the test data, to keep the backup small"
-exclude() { tmutil addexclusion -p "$1" 2>/dev/null || echo "  (could not exclude $1)"; }
+exclude() {
+    if tmutil addexclusion -p "$1" 2>/dev/null; then EXCLUDED+=("$1"); else echo "  (could not exclude $1)"; fi
+}
 for p in /System/Volumes/Data/*; do
     name=${p##*/}
     [[ "$name" == "Users" ]] && continue

@@ -378,10 +378,36 @@ repo_exists() {
     rclone lsf "${RCLONE_REMOTE}:${DRIVE_FOLDER}" --files-only --max-depth 1 2>/dev/null | grep -qx config
 }
 
-# Backup dates already uploaded, oldest first.
+# Snapshots where restic couldn't read every file carry this extra tag. They
+# don't count as uploaded, so the backup is tried again on the next run.
+INCOMPLETE_TAG="tm2gdrive-incomplete"
+
+# Tag lists of all tm2gdrive snapshots, one JSON array per line.
+snapshot_tag_lists() {
+    restic_cmd snapshots --no-lock --json --tag tm2gdrive 2>/dev/null | grep -oE '"tags":\[[^]]*\]'
+}
+
+# Backup dates fully uploaded, oldest first.
 uploaded_dates() {
-    restic_cmd snapshots --no-lock --json --tag tm2gdrive 2>/dev/null \
+    snapshot_tag_lists | grep -vF "\"$INCOMPLETE_TAG\"" \
         | grep -oE "\"tm:${DATE_RE}\"" | grep -oE "$DATE_RE" | sort -u
+}
+
+# Backup dates uploaded with unreadable files and no complete copy yet.
+incomplete_dates() {
+    local complete
+    complete=$(uploaded_dates)
+    snapshot_tag_lists | grep -F "\"$INCOMPLETE_TAG\"" \
+        | grep -oE "\"tm:${DATE_RE}\"" | grep -oE "$DATE_RE" | sort -u \
+        | while IFS= read -r d; do
+            printf '%s\n' "$complete" | grep -qx "$d" || echo "$d"
+        done
+}
+
+# IDs of the snapshots carrying all the given tags (comma-separated).
+ids_with_tags() {
+    restic_cmd snapshots --no-lock --json --tag "$1" 2>/dev/null \
+        | grep -oE '"id":"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}'
 }
 
 snapshot_id_for() {
@@ -412,22 +438,35 @@ human_gb() {
 }
 
 # One backup run at a time (restic itself would let two run side by side).
+# mkdir is atomic, so only one run can create the lock directory.
 acquire_lock() {
-    local pid
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local pid tries=0
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
         pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            die "Another $PROG backup is already running (process $pid)."
+        if [[ -n "$pid" ]]; then
+            kill -0 "$pid" 2>/dev/null && die "Another $PROG backup is already running (process $pid)."
+        elif [[ -z "$(find "$LOCK_DIR" -maxdepth 0 -mmin +2 2>/dev/null)" ]]; then
+            die "Another $PROG backup is starting right now."
         fi
-        rm -rf "$LOCK_DIR"
-        mkdir "$LOCK_DIR" || die "Cannot create $LOCK_DIR"
-    fi
+        # Left behind by a run that crashed: move it aside atomically and retry.
+        mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null && rm -rf "$LOCK_DIR.stale.$$"
+        tries=$((tries + 1))
+        [[ $tries -le 3 ]] || die "Cannot take over the lock $LOCK_DIR. If no backup is running, delete it."
+    done
     echo $$ > "$LOCK_DIR/pid"
     LOCKED=1
+    # Two runs that took over the same stale lock at once: the last writer wins.
+    sleep 1
+    if [[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" != "$$" ]]; then
+        LOCKED=""
+        die "Another $PROG backup is already running."
+    fi
 }
 
 release_lock() {
-    [[ -n "$LOCKED" ]] && rm -rf "$LOCK_DIR"
+    if [[ -n "$LOCKED" && "$(cat "$LOCK_DIR/pid" 2>/dev/null)" == "$$" ]]; then
+        rm -rf "$LOCK_DIR"
+    fi
     LOCKED=""
 }
 
@@ -493,7 +532,14 @@ cmd_setup() {
     # 4. Google Drive: an rclone remote using the user's own OAuth client
     export_env
     if rclone listremotes 2>/dev/null | grep -qx "${RCLONE_REMOTE}:"; then
-        ok "Google Drive connection \"$RCLONE_REMOTE\" already configured"
+        if [[ "$scope" == "drive" ]]; then
+            info "Switching \"$RCLONE_REMOTE\" to full Google Drive access. A browser window will open to approve it."
+            rclone config update "$RCLONE_REMOTE" scope=drive \
+                || die "Could not update the Google Drive connection."
+            ok "Google Drive connection now has full Drive access"
+        else
+            ok "Google Drive connection \"$RCLONE_REMOTE\" already configured"
+        fi
     else
         echo
         echo "${C_BLD}Connect Google Drive${C_OFF}"
@@ -584,13 +630,16 @@ cmd_status() {
     check_repo
     info "Time Machine disk: $TM_DEST ($DEST_FS${DEST_DEV:+, $DEST_DEV})"
 
-    local dates up total=0 done_n=0 d mark only_drive=""
+    local dates up incomplete total=0 done_n=0 d mark only_drive=""
     dates=$(list_tm_dates)
     up=$(uploaded_dates)
+    incomplete=$(incomplete_dates)
     for d in $dates; do
         total=$((total + 1))
         if printf '%s\n' "$up" | grep -qx "$d"; then
             mark="${C_GRN}uploaded${C_OFF}"; done_n=$((done_n + 1))
+        elif printf '%s\n' "$incomplete" | grep -qx "$d"; then
+            mark="${C_YEL}incomplete (some files unreadable; retried next backup)${C_OFF}"
         else
             mark="${C_YEL}pending${C_OFF}"
         fi
@@ -638,6 +687,7 @@ cmd_inspect() {
     latest=$(list_tm_dates | tail -1)
     if [[ -n "$latest" ]]; then
         echo "== contents of latest backup ($latest)"
+        MNT="$MNT-inspect"   # never touch the mount of a backup that may be running
         trap unmount_snapshot EXIT
         if resolve_backup_dir "$latest"; then
             echo "folder: $SRC_DIR"
@@ -728,8 +778,8 @@ cmd_backup() {
         info "Upload speed capped at $DAILY_UPLOAD_GB GiB/day to stay under Google's 750 GB/day limit."
     fi
 
-    local i=0 n_done=0 n_skipped=0 errfile="$LOG_DIR/.restic-stderr"
-    local entries e parent_date parent_args ts attempt_errors status id
+    local i=0 n_done=0 n_skipped=0 n_incomplete=0 errfile="$LOG_DIR/.restic-stderr"
+    local entries e parent_date parent_args ts attempt_errors status id old_ids old_incomplete
     for d in $todo; do
         i=$((i + 1))
         echo
@@ -768,6 +818,8 @@ cmd_backup() {
         fi
 
         ts="${d:0:10} ${d:11:2}:${d:13:2}:${d:15:2}"
+        old_ids=$(ids_with_tags "tm:$d")
+        old_incomplete=$(ids_with_tags "tm:$d,$INCOMPLETE_TAG")
         attempt_errors=0
         while :; do
             (
@@ -789,16 +841,22 @@ cmd_backup() {
 
             if [[ $status -eq 0 ]]; then
                 ok "Uploaded $d"
+                n_done=$((n_done + 1))
+                up=$(printf '%s\n%s\n' "$up" "$d" | grep . | sort -u)
                 break
             elif [[ $status -eq 3 ]]; then
-                # Snapshot saved, but some files were unreadable. If the whole disk
-                # vanished mid-upload the snapshot is incomplete: drop it.
-                if ! ls -A "$SRC_DIR" >/dev/null 2>&1; then
-                    id=$(snapshot_id_for "$d")
-                    [[ -n "$id" ]] && restic_cmd forget "$id" >/dev/null 2>&1
+                # Snapshot saved, but some files couldn't be read. Mark it
+                # incomplete so it is not counted as uploaded and gets retried.
+                for id in $(ids_with_tags "tm:$d"); do
+                    printf '%s\n' "$old_ids" | grep -qx "$id" && continue
+                    restic_cmd tag --add "$INCOMPLETE_TAG" "$id" >/dev/null 2>&1 \
+                        || die "Could not mark backup $d as incomplete. Run \"$PROG backup\" again."
+                done
+                if [[ -z "$(ls -A "$SRC_DIR" 2>/dev/null)" ]]; then
                     die "The Time Machine disk stopped responding during the upload. Reconnect it and run \"$PROG backup\" to continue."
                 fi
-                warn "Uploaded $d, but some files could not be read (listed above and in the log)."
+                warn "Uploaded $d, but some files could not be read (listed above and in the log). It will be retried on the next run."
+                n_incomplete=$((n_incomplete + 1))
                 break
             elif [[ $status -eq 130 ]]; then
                 exit 130
@@ -823,8 +881,10 @@ cmd_backup() {
             fi
         done
 
-        n_done=$((n_done + 1))
-        up=$(printf '%s\n%s\n' "$up" "$d" | grep . | sort -u)
+        # Replace earlier incomplete attempts at this backup.
+        for id in $old_incomplete; do
+            restic_cmd forget "$id" >/dev/null 2>&1
+        done
         unmount_snapshot
     done
     rm -f "$errfile"
@@ -833,11 +893,10 @@ cmd_backup() {
     if [[ -n "$dry_run" ]]; then
         ok "Dry run finished: $((n_todo - n_skipped)) backup(s) would be uploaded."
     else
-        if [[ $n_skipped -gt 0 ]]; then
-            ok "Finished: $n_done backup(s) uploaded, $n_skipped skipped."
-        else
-            ok "Finished: $n_done backup(s) uploaded."
-        fi
+        local summary="Finished: $n_done backup(s) uploaded"
+        [[ $n_incomplete -gt 0 ]] && summary="$summary, $n_incomplete with unreadable files (retried next run)"
+        [[ $n_skipped -gt 0 ]] && summary="$summary, $n_skipped skipped"
+        ok "$summary."
         info "Tip: run \"$PROG verify\" from time to time to check the data on Google Drive."
     fi
 }
