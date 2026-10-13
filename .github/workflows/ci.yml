@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck tm2gdrive install.sh test/run-tests.sh test/mocks/* test/integration-macos.sh
+
+  test-linux:
+    name: Tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install restic and rclone
+        run: |
+          set -e
+          v=$(curl -fsSL https://api.github.com/repos/restic/restic/releases/latest | grep -oE '"tag_name": *"v[^"]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          curl -fsSL "https://github.com/restic/restic/releases/download/v$v/restic_${v}_linux_amd64.bz2" | bunzip2 > restic
+          sudo install -m 755 restic /usr/local/bin/restic
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          restic version && rclone version | head -1
+      - name: Run tests
+        run: sudo -E env "PATH=$PATH" bash test/run-tests.sh
+
+  test-macos:
+    name: Tests (macOS, bash 3.2)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install restic and rclone
+        run: brew install restic rclone
+      - name: Run tests with the system /bin/bash
+        run: |
+          /bin/bash --version | head -1
+          sudo -E env "PATH=$PATH" /bin/bash test/run-tests.sh
+
+  integration-macos:
+    name: Real Time Machine backup (macOS, experimental)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install restic and rclone
+        run: brew install restic rclone
+      - name: Back up a real Time Machine disk and restore it
+        run: sudo -E env "PATH=$PATH" /bin/bash test/integration-macos.sh
