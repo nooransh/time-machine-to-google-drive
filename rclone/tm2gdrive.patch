@@ -1,0 +1,245 @@
+diff --git a/vfs/file.go b/vfs/file.go
+index 11d63d8..48e7096 100644
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -194,6 +194,30 @@ func (f *File) Node() Node {
+ 	return f
+ }
+ 
++// freshObject returns f.o, looked up again at p (the file's current
++// remote path) if a parent directory was renamed after the file was
++// uploaded: f.o still has the old path then, so moving or removing it
++// would fail.
++func (f *File) freshObject(ctx context.Context, p string) fs.Object {
++	f.mu.RLock()
++	o, d := f.o, f.d
++	f.mu.RUnlock()
++	if o == nil || o.Remote() == p {
++		return o
++	}
++	fresh, err := d.Fs().NewObject(ctx, p)
++	if err != nil {
++		fs.Debugf(p, "Couldn't find object after directory rename: %v", err)
++		return o
++	}
++	f.mu.Lock()
++	if f.o == o {
++		f.o = fresh
++	}
++	f.mu.Unlock()
++	return fresh
++}
++
+ // renameDir - call when parent directory has been renamed
+ func (f *File) renameDir(dPath string) {
+ 	f.mu.RLock()
+@@ -246,8 +270,8 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
+ 			}
+ 		}
+ 
++		o := f.freshObject(ctx, oldPath)
+ 		f.mu.RLock()
+-		o := f.o
+ 		d := f.d
+ 		f.mu.RUnlock()
+ 		var newObject fs.Object
+@@ -676,6 +700,7 @@ func (f *File) Remove() (err error) {
+ 		wasWriting = d.vfs.cache.Remove(f.CachePath())
+ 	}
+ 
++	f.freshObject(f.ctx, f.Path())
+ 	f.muRW.Lock() // muRW must be locked before mu to avoid
+ 	f.mu.Lock()   // deadlock in RWFileHandle.openPending and .close
+ 	if f.o != nil {
+@@ -951,15 +976,23 @@ func (f *File) Truncate(size int64) (err error) {
+ 		}
+ 	}
+ 
+-	// if o is nil it isn't valid yet
+-	o, err := f.waitForValidObject()
+-	if err != nil {
+-		return err
+-	}
++	// A file that was written and closed but not uploaded yet has no
++	// object, but its data is in the VFS cache: truncate it there.
++	o := f.getObject()
++	cacheMode := f.d.vfs.Opt.CacheMode
++	inCache := o == nil && cacheMode >= vfscommon.CacheModeMinimal && f.d.vfs.cache != nil &&
++		(f.d.vfs.cache.InUse(f.CachePath()) || f.d.vfs.cache.Exists(f.CachePath()))
++	if !inCache {
++		// if o is nil it isn't valid yet
++		o, err = f.waitForValidObject()
++		if err != nil {
++			return err
++		}
+ 
+-	// If no writers, and size is already correct then all done
+-	if o.Size() == size {
+-		return nil
++		// If no writers, and size is already correct then all done
++		if o.Size() == size {
++			return nil
++		}
+ 	}
+ 
+ 	fs.Debugf(f.Path(), "Truncating file")
+diff --git a/vfs/read_write.go b/vfs/read_write.go
+index 56b9c46..12de605 100644
+--- a/vfs/read_write.go
++++ b/vfs/read_write.go
+@@ -27,7 +27,20 @@ type RWFileHandle struct {
+ 	offset      int64 // file pointer offset
+ 	closed      bool  // set if handle has been closed
+ 	opened      bool
+-	writeCalled bool // if any Write() methods have been called
++	writeCalled bool       // if any Write() methods have been called
++	writing     int        // number of writes in progress with mu unlocked
++	writeDone   *sync.Cond // signalled when a write in progress finishes
++}
++
++// _waitForWrites waits until no writes are in progress, so closing
++// the handle doesn't fail writes which are still running (they can
++// be paused by --vfs-cache-max-pending).
++//
++// Call with fh.mu held.
++func (fh *RWFileHandle) _waitForWrites() {
++	for fh.writing > 0 {
++		fh.writeDone.Wait()
++	}
+ }
+ 
+ // Lock performs Unix locking, not supported
+@@ -183,6 +196,7 @@ func (fh *RWFileHandle) close() (err error) {
+ func (fh *RWFileHandle) Close() error {
+ 	fh.mu.Lock()
+ 	defer fh.mu.Unlock()
++	fh._waitForWrites()
+ 	return fh.close()
+ }
+ 
+@@ -205,6 +219,7 @@ func (fh *RWFileHandle) Release() error {
+ 	fh.mu.Lock()
+ 	defer fh.mu.Unlock()
+ 	fs.Debugf(fh.logPrefix(), "RWFileHandle.Release")
++	fh._waitForWrites()
+ 	if fh.closed {
+ 		// Don't return an error if called twice
+ 		return nil
+@@ -347,11 +362,17 @@ func (fh *RWFileHandle) _writeAt(b []byte, off int64, release bool) (n int, err
+ 	fh.writeCalled = true
+ 	if release {
+ 		// Do the writing with fh.mu unlocked
++		if fh.writeDone == nil {
++			fh.writeDone = sync.NewCond(&fh.mu)
++		}
++		fh.writing++
+ 		fh.mu.Unlock()
+ 	}
+ 	n, err = fh.item.WriteAt(b, off)
+ 	if release {
+ 		fh.mu.Lock()
++		fh.writing--
++		fh.writeDone.Broadcast()
+ 	}
+ 	if err != nil {
+ 		return n, err
+diff --git a/vfs/vfscache/cache.go b/vfs/vfscache/cache.go
+index ca79f22..5369770 100644
+--- a/vfs/vfscache/cache.go
++++ b/vfs/vfscache/cache.go
+@@ -161,6 +161,8 @@ func (c *Cache) Stats() (out rc.Params) {
+ 	uploadsInProgress, uploadsQueued := c.writeback.Stats()
+ 	out["uploadsInProgress"] = uploadsInProgress
+ 	out["uploadsQueued"] = uploadsQueued
++	out["dirtyFiles"], out["dirtyBytes"] = c.dirtyStats(true)
++	out["pendingFiles"], out["pendingBytes"] = c.dirtyStats(false)
+ 
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+@@ -877,6 +879,50 @@ func (c *Cache) cleaner(ctx context.Context) {
+ 	}
+ }
+ 
++// dirtyStats returns the number and total size of the files which
++// haven't been uploaded yet. Files which are still open are only
++// counted if includeOpen is set.
++func (c *Cache) dirtyStats(includeOpen bool) (files int, bytes int64) {
++	c.mu.Lock()
++	items := make([]*Item, 0, len(c.item))
++	for _, item := range c.item {
++		items = append(items, item)
++	}
++	c.mu.Unlock()
++	for _, item := range items {
++		item.mu.Lock()
++		if item.info.Dirty && (includeOpen || item.opens == 0) {
++			files++
++			bytes += item.info.Size
++		}
++		item.mu.Unlock()
++	}
++	return files, bytes
++}
++
++// waitForUploads blocks while more than --vfs-cache-max-pending of
++// closed files are waiting to be uploaded, so that writers slow down
++// to the upload speed instead of filling the disk.
++//
++// Files which are still open don't count, as they can't be uploaded
++// until they are closed.
++func (c *Cache) waitForUploads() {
++	limit := int64(c.opt.CacheMaxPending)
++	if limit <= 0 {
++		return
++	}
++	for {
++		if _, pending := c.dirtyStats(false); pending <= limit {
++			return
++		}
++		select {
++		case <-c.ctx.Done():
++			return
++		case <-time.After(250 * time.Millisecond):
++		}
++	}
++}
++
+ // TotalInUse returns the number of items in the cache which are InUse
+ func (c *Cache) TotalInUse() (n int) {
+ 	c.mu.Lock()
+diff --git a/vfs/vfscache/item.go b/vfs/vfscache/item.go
+index f25f907..fdaf2fe 100644
+--- a/vfs/vfscache/item.go
++++ b/vfs/vfscache/item.go
+@@ -1429,6 +1429,7 @@ func (item *Item) readAt(b []byte, off int64) (n int, err error) {
+ 
+ // WriteAt bytes to the file at off
+ func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
++	item.c.waitForUploads()
+ 	item.preAccess()
+ 	defer item.postAccess()
+ 	item.mu.Lock()
+diff --git a/vfs/vfscommon/options.go b/vfs/vfscommon/options.go
+index 927fff6..33c13d7 100644
+--- a/vfs/vfscommon/options.go
++++ b/vfs/vfscommon/options.go
+@@ -70,6 +70,11 @@ var OptionsInfo = fs.Options{{
+ 	Default: fs.SizeSuffix(-1),
+ 	Help:    "Max total size of objects in the cache",
+ 	Groups:  "VFS",
++}, {
++	Name:    "vfs_cache_max_pending",
++	Default: fs.SizeSuffix(-1),
++	Help:    "Pause writes while more than this much closed data is waiting to be uploaded",
++	Groups:  "VFS",
+ }, {
+ 	Name:    "vfs_cache_min_free_space",
+ 	Default: fs.SizeSuffix(-1),
+@@ -204,6 +209,7 @@ type Options struct {
+ 	CacheMaxAge        fs.Duration   `config:"vfs_cache_max_age"`
+ 	CacheMaxSize       fs.SizeSuffix `config:"vfs_cache_max_size"`
+ 	CacheMinFreeSpace  fs.SizeSuffix `config:"vfs_cache_min_free_space"`
++	CacheMaxPending    fs.SizeSuffix `config:"vfs_cache_max_pending"`
+ 	CachePollInterval  fs.Duration   `config:"vfs_cache_poll_interval"`
+ 	CaseInsensitive    bool          `config:"vfs_case_insensitive"`
+ 	BlockNormDupes     bool          `config:"vfs_block_norm_dupes"`

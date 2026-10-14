@@ -1,0 +1,71 @@
+name: Build patched rclone
+
+# Builds rclone with tm2gdrive's patches (rclone/README.md). A tag like
+# rclone-v1.75.2-tm2gdrive.1 publishes a release; a manual run only keeps the
+# files as a workflow artifact.
+
+on:
+  push:
+    tags: ["rclone-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out rclone and apply the patches
+        run: |
+          git clone --depth 1 --branch "$(cat rclone/VERSION)" https://github.com/rclone/rclone.git rclone-src
+          git -C rclone-src apply "$PWD/rclone/tm2gdrive.patch"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: rclone-src/go.mod
+          cache-dependency-path: rclone-src/go.sum
+
+      - name: Install the FUSE headers (FUSE-T)
+        run: brew install --cask macos-fuse-t/cask/fuse-t
+
+      - name: Test the patched packages
+        working-directory: rclone-src
+        run: go test ./vfs/ ./vfs/vfscache/ -count=1
+
+      - name: Build for Apple silicon and Intel
+        working-directory: rclone-src
+        run: |
+          suffix="${GITHUB_REF_NAME#rclone-*-}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || suffix="tm2gdrive.dev"
+          mkdir -p ../out
+          for arch in arm64 amd64; do
+            cc_arch=$arch; [[ $arch == amd64 ]] && cc_arch=x86_64
+            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch CC="clang -arch $cc_arch" \
+              go build -tags cmount -trimpath \
+                -ldflags "-s -w -X github.com/rclone/rclone/fs.VersionSuffix=$suffix" \
+                -o "../out/$arch/rclone" .
+            (cd "../out/$arch" && zip -q "../rclone-darwin-$arch.zip" rclone)
+          done
+          ../out/arm64/rclone version | head -1
+          ../out/arm64/rclone mount --help | grep -- --vfs-cache-max-pending
+          cd ../out && shasum -a 256 ./*.zip | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: rclone-tm2gdrive
+          path: |
+            out/*.zip
+            out/SHA256SUMS
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/*.zip out/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --notes "rclone $(cat rclone/VERSION) with tm2gdrive's patches (see rclone/README.md). Built by this workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
