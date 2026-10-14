@@ -1,16 +1,16 @@
 #!/bin/bash
 #
-# tm2gdrive - use Google Drive as a Time Machine backup disk.
+# tm2gdrive - Time Machine backups to Google Drive, encrypted on the Mac.
 #
 # How it works (details in README.md):
-#   * rclone serves a Google Drive folder over NFS on 127.0.0.1, and macOS
-#     mounts it with its built-in NFS client (no kernel extensions, no VM).
-#   * On that mount lives an encrypted APFS disk image (a sparse bundle, stored
-#     as many small "band" files). It is attached as a normal disk called
-#     "Google Drive Backup", and Time Machine backs up to it every hour.
-#   * Writes land in a local cache first and are uploaded in the background;
-#     anything not yet uploaded survives restarts and is uploaded later.
-#   * A LaunchDaemon keeps all of this running across reboots and sleep.
+#   * rclone mounts an encrypted ("crypt") Google Drive folder on the Mac with
+#     FUSE-T, a FUSE implementation without kernel extensions.
+#   * Samba shares that folder on 127.0.0.1 only, as a Time Machine network
+#     disk. Time Machine backs up to it every hour, like to a NAS.
+#   * Changed files are kept on the Mac until they are uploaded. When too much
+#     is waiting, writes pause, so a first backup never fills the Mac's disk.
+#   * Everything runs as you (a LaunchAgent), not as root. Setup only needs
+#     administrator rights to install FUSE-T and to add the Time Machine disk.
 #
 # https://github.com/nooranshdhaka/time-machine-to-google-drive
 #
@@ -18,46 +18,52 @@
 
 set -o pipefail
 
-VERSION="2.0.0"
+VERSION="3.0.0"
 PROG="tm2gdrive"
 LABEL="io.github.nooranshdhaka.tm2gdrive"
-
+REPO="nooranshdhaka/time-machine-to-google-drive"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 # ---------------------------------------------------------------------------
 # Locations (the TM2GDRIVE_* overrides exist for the test suite)
 # ---------------------------------------------------------------------------
-STATE_DIR="${TM2GDRIVE_STATE_DIR:-/Library/Application Support/tm2gdrive}"
-CACHE_DIR="${TM2GDRIVE_CACHE_DIR:-/Library/Caches/tm2gdrive}"
-DRIVE_MNT="${TM2GDRIVE_DRIVE_MNT:-/private/var/tm2gdrive/drive}"
-LOG_FILE="${TM2GDRIVE_LOG:-/Library/Logs/tm2gdrive.log}"
-PLIST="${TM2GDRIVE_PLIST:-/Library/LaunchDaemons/$LABEL.plist}"
-
+STATE_DIR="${TM2GDRIVE_STATE_DIR:-$HOME/Library/Application Support/tm2gdrive}"
+CACHE_DIR="${TM2GDRIVE_CACHE_DIR:-$HOME/Library/Caches/tm2gdrive}"
+LOG_FILE="${TM2GDRIVE_LOG:-$HOME/Library/Logs/tm2gdrive.log}"
+PLIST="${TM2GDRIVE_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
 CONFIG_FILE="$STATE_DIR/config"
 RCLONE_CONF="$STATE_DIR/rclone.conf"
-PASSWORD_FILE="$STATE_DIR/disk-password"
+SMB_PASSWORD_FILE="$STATE_DIR/smb-password"
+BIN_DIR="$STATE_DIR/bin"
+RCLONE="${TM2GDRIVE_RCLONE:-$BIN_DIR/rclone}"
+SAMBA_DIR="$STATE_DIR/samba"
+SMB_CONF="$SAMBA_DIR/smb.conf"
+DRIVE_MNT="${TM2GDRIVE_DRIVE_MNT:-$STATE_DIR/drive}"
 RC_SOCKET="$STATE_DIR/rc.sock"
-BIN_DIR="$STATE_DIR/bin"            # root-owned copies of tm2gdrive and rclone, run by the service
-IMAGE_NAME="TimeMachine.sparsebundle"
-IMAGE="$DRIVE_MNT/$IMAGE_NAME"
+SHARE="tm2gdrive"           # Samba share name; Time Machine shows it as the disk name
+SMB_USER="tm2gdrive"        # share login, mapped to the Mac user (see write_smb_conf)
+DRIVE_REMOTE="gdrive"       # rclone remote for Google Drive (in $RCLONE_CONF)
+CRYPT_REMOTE="tm2gdrive"    # rclone crypt remote on top of it
+
+# rclone with tm2gdrive's patches (rclone/README.md), built by GitHub Actions
+# from rclone's source. Setup downloads it and checks these checksums.
+RCLONE_RELEASE="rclone-v1.75.2-tm2gdrive.1"
+RCLONE_SHA256_ARM64="0c4dd0937420bbc5b87396cb7f84772df4048b57e7d809224eac48082f3536a0"
+RCLONE_SHA256_AMD64="28217d98a5dfa36010f8a88c0917c2597896e8e06baa0eab804e45cad12bd228"
 
 # ---------------------------------------------------------------------------
 # Settings (override in $CONFIG_FILE)
 # ---------------------------------------------------------------------------
-SETTINGS="RCLONE_REMOTE DRIVE_FOLDER VOLUME_NAME DISK_SIZE_GB CACHE_MAX_GB CACHE_MIN_FREE_GB NFS_PORT TRANSFERS BWLIMIT"
-NUMERIC_SETTINGS="DISK_SIZE_GB CACHE_MAX_GB CACHE_MIN_FREE_GB NFS_PORT TRANSFERS"
-
-RCLONE_REMOTE="gdrive"                 # rclone remote name (in $RCLONE_CONF)
-DRIVE_FOLDER="tm2gdrive"               # Google Drive folder that holds the backup disk
-VOLUME_NAME="Google Drive Backup"      # name of the backup disk in Finder and Time Machine
-DISK_SIZE_GB=0                         # maximum size of the backup disk; 0 = chosen at setup
-CACHE_MAX_GB=50                        # local cache of already-uploaded data, for speed
-CACHE_MIN_FREE_GB=20                   # keep at least this much free space on the Mac
-NFS_PORT=52049                         # local port of the NFS server (127.0.0.1 only)
-TRANSFERS=8                            # parallel uploads
-BWLIMIT=""                             # optional bandwidth limit, e.g. "20M" (rclone --bwlimit)
-
-BAND_SECTORS=32768                     # 16 MiB bands: few files for Drive, small re-uploads
+SETTINGS="DRIVE_FOLDER BACKUP_SIZE_GB SMB_PORT CACHE_MAX_GB MAX_PENDING_GB CACHE_MIN_FREE_GB TRANSFERS BWLIMIT"
+NUMERIC_SETTINGS="BACKUP_SIZE_GB SMB_PORT CACHE_MAX_GB MAX_PENDING_GB CACHE_MIN_FREE_GB TRANSFERS"
+DRIVE_FOLDER="tm2gdrive-backups"   # Google Drive folder that holds the encrypted backups
+BACKUP_SIZE_GB=0                   # size limit Time Machine sees; 0 = chosen at setup
+SMB_PORT=44545                     # local port of the Time Machine share (127.0.0.1 only)
+CACHE_MAX_GB=5                     # keep up to this much already-uploaded data on the Mac
+MAX_PENDING_GB=5                   # pause backups while this much is waiting to upload
+CACHE_MIN_FREE_GB=20               # keep at least this much free space on the Mac
+TRANSFERS=4                        # parallel uploads
+BWLIMIT=""                         # optional bandwidth limit, e.g. "20M" (rclone --bwlimit)
 
 # ---------------------------------------------------------------------------
 # Output
@@ -67,7 +73,6 @@ if [[ -t 1 ]]; then
 else
     C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_BLD=""; C_OFF=""
 fi
-
 info() { printf '%s==>%s %s\n' "$C_BLU" "$C_OFF" "$*"; }
 ok()   { printf '%s✔%s %s\n' "$C_GRN" "$C_OFF" "$*"; }
 warn() { printf '%s!%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
@@ -88,7 +93,7 @@ confirm() {
 # Config
 # ---------------------------------------------------------------------------
 
-# Reads KEY=value lines. The file is parsed, never executed (it is read as root).
+# Reads KEY=value lines. The file is parsed, never executed.
 read_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
     local line key val
@@ -122,21 +127,23 @@ load_config() {
     for key in $NUMERIC_SETTINGS; do
         [[ "${!key}" =~ ^[0-9]+$ ]] || die "$key in $CONFIG_FILE must be a whole number."
     done
-    [[ -n "$VOLUME_NAME" && "$VOLUME_NAME" != */* ]] || die "VOLUME_NAME in $CONFIG_FILE is not a valid disk name."
-    VOLUME="/Volumes/$VOLUME_NAME"
+    [[ $SMB_PORT -ge 1024 && $SMB_PORT -le 65535 ]] || die "SMB_PORT in $CONFIG_FILE must be between 1024 and 65535."
+    [[ $TRANSFERS -ge 1 ]] || die "TRANSFERS in $CONFIG_FILE must be at least 1."
+    [[ -n "$DRIVE_FOLDER" && "$DRIVE_FOLDER" != /* && "$DRIVE_FOLDER" != *..* ]] \
+        || die "DRIVE_FOLDER in $CONFIG_FILE is not a valid folder name."
+    [[ "$BWLIMIT" =~ ^[0-9A-Za-z.:,\ -]*$ ]] || die "BWLIMIT in $CONFIG_FILE is not a valid rclone --bwlimit value."
 }
 
 write_config() {
     cat > "$CONFIG_FILE" <<EOF
 # tm2gdrive settings. See "Settings" in README.md.
-# After editing, restart the service: sudo tm2gdrive restart
-RCLONE_REMOTE="$RCLONE_REMOTE"
+# After editing, restart the service: $PROG restart
 DRIVE_FOLDER="$DRIVE_FOLDER"
-VOLUME_NAME="$VOLUME_NAME"
-DISK_SIZE_GB=$DISK_SIZE_GB
+BACKUP_SIZE_GB=$BACKUP_SIZE_GB
+SMB_PORT=$SMB_PORT
 CACHE_MAX_GB=$CACHE_MAX_GB
+MAX_PENDING_GB=$MAX_PENDING_GB
 CACHE_MIN_FREE_GB=$CACHE_MIN_FREE_GB
-NFS_PORT=$NFS_PORT
 TRANSFERS=$TRANSFERS
 BWLIMIT="$BWLIMIT"
 EOF
@@ -150,72 +157,29 @@ require_macos() {
     [[ "$(uname -s)" == "Darwin" ]] || die "$PROG runs on macOS."
 }
 
-require_root() {
-    [[ $EUID -eq 0 ]] || die "This needs administrator rights. Run: sudo $PROG $*"
-}
-
-# Re-runs this script as root.
-ensure_root() {
-    if [[ $EUID -ne 0 ]]; then
-        exec sudo "$0" "$@"
-    fi
+require_user() {
+    [[ $EUID -ne 0 ]] || die "Run $PROG as your normal user, without sudo. It asks for your password when it needs it."
 }
 
 require_setup() {
     [[ -f "$CONFIG_FILE" && -f "$RCLONE_CONF" ]] || die "$PROG is not set up yet. Run: $PROG setup"
 }
 
-# rclone 1.65+ has "serve nfs". $1 = the rclone command to ask.
-rclone_ok() {
-    local v major minor
-    v=$("$1" version 2>/dev/null | awk 'NR == 1 { sub(/^v/, "", $2); print $2 }')
-    major=${v%%.*}; minor=${v#*.}; minor=${minor%%.*}
-    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
-    [[ $major -gt 1 || $minor -ge 65 ]]
+# Homebrew's Samba (the smbd binary is renamed to avoid clashing with macOS's).
+samba_prefix() {
+    local p
+    for p in "${TM2GDRIVE_SAMBA_PREFIX:-}" /opt/homebrew/opt/samba /usr/local/opt/samba; do
+        [[ -n "$p" && -x "$p/sbin/samba-dot-org-smbd" ]] && { echo "$p"; return 0; }
+    done
+    return 1
 }
 
-# ---------------------------------------------------------------------------
-# State helpers
-# ---------------------------------------------------------------------------
-# Output is captured before matching: with pipefail, "cmd | grep -q" can report
-# a failure when grep stops reading early.
-drive_mounted()  { [[ "$(mount)" == *" on $DRIVE_MNT (nfs"* ]]; }
-disk_attached()  { [[ "$(hdiutil info 2>/dev/null)" == *"$IMAGE"* ]]; }
-volume_mounted() { [[ "$(mount)" == *" on $VOLUME ("* ]]; }
-tm_running()     { [[ "$(tmutil status 2>/dev/null)" == *"Running = 1"* ]]; }
-service_loaded() { launchctl print "system/$LABEL" >/dev/null 2>&1; }
+fuse_t_installed() { [[ -n "$TM2GDRIVE_SKIP_FUSE_T" || -d /Library/Frameworks/fuse_t.framework ]]; }
 
-rclone_bin() {
-    if [[ -x "$BIN_DIR/rclone" ]]; then echo "$BIN_DIR/rclone"; else command -v rclone; fi
-}
-
-rc() {
-    "$(rclone_bin)" rc --unix-socket "$RC_SOCKET" "$@" 2>/dev/null
-}
-
-# Files waiting to be uploaded (in progress + queued); empty if unknown.
-pending_uploads() {
-    local stats a b
-    stats=$(rc vfs/stats) || return 0
-    a=$(printf '%s' "$stats" | grep -oE '"uploadsInProgress":[[:space:]]*[0-9]+' | grep -oE '[0-9]+$')
-    b=$(printf '%s' "$stats" | grep -oE '"uploadsQueued":[[:space:]]*[0-9]+' | grep -oE '[0-9]+$')
-    [[ -n "$a" && -n "$b" ]] && echo $((a + b))
-}
-
-drive_free_bytes() {
-    "$(rclone_bin)" --config "$RCLONE_CONF" about "${RCLONE_REMOTE}:" --json 2>/dev/null \
-        | grep -oE '"free":[[:space:]]*[0-9]+' | grep -oE '[0-9]+$'
-}
-
-human_gb() { awk -v b="$1" 'BEGIN { printf "%.0f GB", b / 1000000000 }'; }
-
-# Time Machine destination ID whose mount point is our backup disk.
-tm_destination_id() {
-    tmutil destinationinfo 2>/dev/null | awk -v m="$VOLUME" '
-        /^====/ { if (found && id != "") { print id; done = 1; exit } id = ""; found = 0; next }
-        /^ID/ { sub(/^ID[[:space:]]*:[[:space:]]*/, ""); id = $0 }
-        /^Mount Point/ { sub(/^Mount Point[[:space:]]*:[[:space:]]*/, ""); if ($0 == m) found = 1 }
-        END { if (!done && found && id != "") print id }'
+# tm2gdrive needs rclone with its patches (rclone/README.md).
+rclone_patched() {
+    local help
+    [[ -x "$RCLONE" ]] && help=$("$RCLONE" mount --help 2>/dev/null) && [[ "$help" == *--vfs-cache-max-pending* ]]
 }
 
 # Adding a Time Machine disk from the command line needs Full Disk Access for
@@ -224,9 +188,8 @@ tm_destination_id() {
 # apps with Full Disk Access can list. Unknown counts as yes; tmutil decides.
 has_full_disk_access() {
     [[ -n "$TM2GDRIVE_SKIP_FDA_CHECK" ]] && return 0
-    local home="$HOME" dir tried=""
-    [[ -n "$SUDO_USER" ]] && home=$(eval echo "~$SUDO_USER")
-    for dir in "$home/Library/Safari" "$home/Library/Mail" "$home/Library/Application Support/com.apple.TCC"; do
+    local dir tried=""
+    for dir in "$HOME/Library/Safari" "$HOME/Library/Mail" "$HOME/Library/Application Support/com.apple.TCC"; do
         [[ -e "$dir" ]] || continue
         tried=1
         ls "$dir" >/dev/null 2>&1 && return 0
@@ -238,6 +201,52 @@ FDA_HELP="Open System Settings > Privacy & Security > Full Disk Access and turn 
     your terminal app (Terminal or iTerm). Then quit the terminal (Cmd-Q), open it
     again and run: $PROG setup"
 
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+# Output is captured before matching: with pipefail, "cmd | grep -q" can report
+# a failure when grep stops reading early.
+drive_mounted()  { [[ "$(mount)" == *" on $DRIVE_MNT ("* ]]; }
+smb_listening()  { nc -z -G 2 127.0.0.1 "$SMB_PORT" >/dev/null 2>&1; }
+tm_running()     { [[ "$(tmutil status 2>/dev/null)" == *"Running = 1"* ]]; }
+agent_loaded()   { launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; }
+
+rc() {
+    "$RCLONE" rc --unix-socket "$RC_SOCKET" "$@" 2>/dev/null
+}
+
+json_number() {   # json_number <key> : reads JSON on stdin
+    grep -oE "\"$1\":[[:space:]]*[0-9]+" | head -1 | grep -oE '[0-9]+$'
+}
+
+# "<files> <bytes> <open files>" not yet uploaded to Google Drive; empty if
+# unknown. Files still open (being written) upload once they are closed.
+pending_uploads() {
+    local stats files bytes dirty
+    stats=$(rc vfs/stats) || return 0
+    files=$(printf '%s' "$stats" | json_number pendingFiles)
+    bytes=$(printf '%s' "$stats" | json_number pendingBytes)
+    dirty=$(printf '%s' "$stats" | json_number dirtyFiles)
+    [[ -n "$files" && -n "$bytes" && -n "$dirty" ]] && echo "$files $bytes $((dirty - files))"
+}
+
+drive_free_bytes() {
+    "$RCLONE" --config "$RCLONE_CONF" about "${DRIVE_REMOTE}:" --json 2>/dev/null | json_number free
+}
+
+human_gb() { awk -v b="$1" 'BEGIN { printf "%.1f GB", b / 1000000000 }'; }
+
+# Time Machine destination ID for our share.
+tm_destination_id() {
+    tmutil destinationinfo 2>/dev/null | awk -v s="$SHARE" '
+        function check() { if (name == s && kind == "Network" && id != "") { print id; return 1 } return 0 }
+        /^====/ { if (check()) { done = 1; exit } name = ""; kind = ""; id = ""; next }
+        /^Name/ { sub(/^Name[[:space:]]*:[[:space:]]*/, ""); name = $0 }
+        /^Kind/ { sub(/^Kind[[:space:]]*:[[:space:]]*/, ""); kind = $0 }
+        /^ID/   { sub(/^ID[[:space:]]*:[[:space:]]*/, ""); id = $0 }
+        END { if (!done) check() }'
+}
+
 wait_for() {   # wait_for <seconds> <command...>
     local t="$1" _
     shift
@@ -248,139 +257,184 @@ wait_for() {   # wait_for <seconds> <command...>
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# The background service (runs as root under launchd)
-# ---------------------------------------------------------------------------
-SERVER_PID=""
-
-# An rclone left running by a crashed service would hold the port.
-kill_stale_server() {
-    local pids
-    pids=$(lsof -nP -t -iTCP:"$NFS_PORT" -sTCP:LISTEN 2>/dev/null)
-    [[ -n "$pids" ]] || return 0
-    log "stopping a leftover NFS server (pid $pids)"
-    local pid
-    for pid in $pids; do kill -TERM "$pid" 2>/dev/null; done
-    # shellcheck disable=SC2016  # evaluated later by wait_for
-    if ! wait_for 30 eval '[[ -z "$(lsof -nP -t -iTCP:"$NFS_PORT" -sTCP:LISTEN 2>/dev/null)" ]]'; then
-        for pid in $pids; do kill -KILL "$pid" 2>/dev/null; done
+# Size limit Time Machine sees. Time Machine picks its band size (the unit it
+# uploads) from it: about limit / 3800, so 1.5x the Mac's data gives about
+# 100 MB bands for a 250 GB Mac while leaving room for history.
+choose_backup_size() {
+    local free="$1" need_b="$2" size cap
+    size=$(( need_b * 3 / 2 / 1000000000 ))
+    [[ $size -lt 100 ]] && size=100
+    if [[ -n "$free" ]]; then
+        cap=$(( free * 9 / 10 / 1000000000 ))
+        [[ $size -gt $cap ]] && size=$cap
     fi
+    echo "$size"
 }
 
-start_server() {
+# ---------------------------------------------------------------------------
+# The background service (a LaunchAgent: runs as the user)
+# ---------------------------------------------------------------------------
+RCLONE_PID=""
+SMBD_PID=""
+
+write_smb_conf() {
+    local s="$SAMBA_DIR"
+    mkdir -p "$s/lock" "$s/state" "$s/cache" "$s/private" "$s/pid"
+    # Time Machine only works with Samba's "fruit" module. Mac metadata goes
+    # into extended attributes, which the macOS kernel keeps in "._" files on
+    # the rclone mount; there is no stream module because streams_xattr and
+    # streams_depot both break on it. Samba runs as the user, so it can only
+    # ever act as the user.
+    # Time Machine logs in as "tm2gdrive", mapped to the Mac user: with the Mac
+    # user's own name, macOS first tries local Kerberos and times out.
+    echo "$(id -un) = $SMB_USER" > "$s/usermap"
+    cat > "$SMB_CONF" <<EOF
+# Written by $PROG at every start; edit $CONFIG_FILE instead.
+[global]
+  server role = standalone server
+  interfaces = 127.0.0.1
+  bind interfaces only = yes
+  smb ports = $SMB_PORT
+  disable netbios = yes
+  map to guest = never
+  username map = $s/usermap
+  server min protocol = SMB3
+  passdb backend = tdbsam:$s/private/passdb.tdb
+  lock directory = $s/lock
+  state directory = $s/state
+  cache directory = $s/cache
+  private dir = $s/private
+  pid directory = $s/pid
+  ncalrpc dir = $s/state/ncalrpc
+  log file = $s/samba.log
+  max log size = 1000
+  log level = 1
+  vfs objects = catia fruit
+  fruit:metadata = netatalk
+  fruit:resource = xattr
+  fruit:model = MacSamba
+  fruit:posix_rename = yes
+  fruit:zero_file_id = yes
+  nt acl support = no
+  create mask = 0600
+  directory mask = 0700
+  vfs mkdir use tmp name = no
+[$SHARE]
+  path = $DRIVE_MNT
+  valid users = $(id -un)
+  read only = no
+  fruit:time machine = yes
+  fruit:time machine max size = ${BACKUP_SIZE_GB}G
+EOF
+    chmod 600 "$SMB_CONF"
+}
+
+start_rclone() {
     local args=(
-        serve nfs "${RCLONE_REMOTE}:${DRIVE_FOLDER}"
-        --addr "127.0.0.1:$NFS_PORT"
+        mount "${CRYPT_REMOTE}:" "$DRIVE_MNT"
         --config "$RCLONE_CONF"
         --cache-dir "$CACHE_DIR"
         --vfs-cache-mode full
+        --vfs-write-back 10s
         --vfs-cache-max-size "${CACHE_MAX_GB}G"
+        --vfs-cache-max-pending "${MAX_PENDING_GB}G"
         --vfs-cache-min-free-space "${CACHE_MIN_FREE_GB}G"
         --vfs-cache-max-age 8760h
-        --vfs-write-back 30s
         --dir-cache-time 8760h
-        --nfs-cache-type disk
-        --nfs-cache-dir "$CACHE_DIR/nfs-handles"
         --transfers "$TRANSFERS"
         --drive-chunk-size 64M
         --drive-use-trash=false
+        --noappledouble=false
+        -o hard_remove
+        --volname "tm2gdrive"
         --rc --rc-addr "unix://$RC_SOCKET" --rc-no-auth
-        --log-level NOTICE
+        --log-level "${TM2GDRIVE_LOG_LEVEL:-NOTICE}"
     )
     [[ -n "$BWLIMIT" ]] && args+=(--bwlimit "$BWLIMIT")
+    mkdir -p "$DRIVE_MNT" "$CACHE_DIR"
     rm -f "$RC_SOCKET"
-    "$(rclone_bin)" "${args[@]}" &
-    SERVER_PID=$!
-    log "started the rclone NFS server (pid $SERVER_PID) for ${RCLONE_REMOTE}:${DRIVE_FOLDER}"
+    "$RCLONE" "${args[@]}" &
+    RCLONE_PID=$!
+    log "started rclone (pid $RCLONE_PID) for Google Drive folder \"$DRIVE_FOLDER\""
     local _
     for _ in $(seq 1 60); do
-        nc -z 127.0.0.1 "$NFS_PORT" 2>/dev/null && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || { log "rclone exited during startup"; return 1; }
+        drive_mounted && { log "mounted the encrypted Drive folder"; return 0; }
+        kill -0 "$RCLONE_PID" 2>/dev/null || { log "rclone exited during startup"; RCLONE_PID=""; return 1; }
         sleep 1
     done
-    log "the rclone NFS server did not start listening"
+    log "the Drive folder did not mount"
     return 1
 }
 
-mount_drive() {
-    mkdir -p "$DRIVE_MNT"
-    # "hard": if rclone restarts, I/O waits for it instead of failing, so the
-    # disk image on top never sees errors. "locallocks": rclone has no NFS lock daemon.
-    if mount -t nfs -o "port=$NFS_PORT,mountport=$NFS_PORT,tcp,vers=3,locallocks,hard,intr,nobrowse" \
-        "127.0.0.1:/" "$DRIVE_MNT"; then
-        log "mounted the Google Drive folder at $DRIVE_MNT"
-    else
-        log "could not mount the NFS share"
-        return 1
+start_samba() {
+    local prefix
+    prefix=$(samba_prefix) || { log "Samba is not installed (brew install samba)"; return 1; }
+    write_smb_conf
+    "$prefix/sbin/samba-dot-org-smbd" --foreground --no-process-group -s "$SMB_CONF" \
+        --log-basename="$SAMBA_DIR" </dev/null &
+    SMBD_PID=$!
+    if wait_for 30 smb_listening; then
+        log "Time Machine share is listening on 127.0.0.1:$SMB_PORT (pid $SMBD_PID)"
+        return 0
     fi
+    log "Samba did not start (see $SAMBA_DIR/samba.log)"
+    stop_pid "$SMBD_PID"; SMBD_PID=""
+    return 1
 }
 
-attach_disk() {
-    [[ -f "$PASSWORD_FILE" ]] || { log "no disk password stored; run setup"; return 1; }
-    mkdir -p "$VOLUME"
-    if tr -d '\n' < "$PASSWORD_FILE" | hdiutil attach -stdinpass -owners on -noverify -noautoopen \
-        -mountpoint "$VOLUME" "$IMAGE" >/dev/null; then
-        # Time Machine needs file ownership on its disk; images on network
-        # storage are attached without it.
-        diskutil enableOwnership "$VOLUME" >/dev/null 2>&1 || log "could not enable ownership on $VOLUME"
-        log "attached the backup disk at $VOLUME"
-    else
-        log "could not attach $IMAGE"
-        rmdir "$VOLUME" 2>/dev/null
-        return 1
-    fi
+stop_pid() {   # TERM, then KILL after 30 seconds
+    [[ -n "$1" ]] && kill -0 "$1" 2>/dev/null || return 0
+    kill -TERM "$1" 2>/dev/null
+    # shellcheck disable=SC2016  # evaluated later by wait_for
+    wait_for 30 eval '! kill -0 "$1" 2>/dev/null' || kill -KILL "$1" 2>/dev/null
 }
 
-detach_disk() {
-    disk_attached || return 0
-    if tm_running; then
-        log "stopping the running Time Machine backup before detaching"
-        tmutil stopbackup 2>/dev/null
-        sleep 5
-    fi
-    hdiutil detach "$VOLUME" >/dev/null 2>&1 \
-        || { sleep 5; hdiutil detach "$VOLUME" >/dev/null 2>&1; } \
-        || hdiutil detach -force "$VOLUME" >/dev/null 2>&1
-    log "detached the backup disk"
+unmount_drive() {
+    drive_mounted || return 0
+    umount "$DRIVE_MNT" 2>/dev/null || diskutil unmount force "$DRIVE_MNT" >/dev/null 2>&1
 }
 
 stop_everything() {
     log "stopping"
-    detach_disk
-    if drive_mounted; then umount "$DRIVE_MNT" 2>/dev/null || umount -f "$DRIVE_MNT" 2>/dev/null; fi
-    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        kill -TERM "$SERVER_PID" 2>/dev/null
-        # shellcheck disable=SC2016  # evaluated later by wait_for
-        wait_for 30 eval '! kill -0 "$SERVER_PID" 2>/dev/null' || kill -KILL "$SERVER_PID" 2>/dev/null
-    fi
+    # Samba first, so nothing writes to the Drive folder while it unmounts.
+    stop_pid "$SMBD_PID"; SMBD_PID=""
+    unmount_drive
+    stop_pid "$RCLONE_PID"; RCLONE_PID=""
     log "stopped (files not yet uploaded are kept and uploaded on the next start)"
 }
 
+# Processes left behind by a crashed service would hold the port or the mount.
+kill_leftovers() {
+    local pids
+    pids=$(pgrep -f "samba-dot-org-smbd .*-s $SMB_CONF" 2>/dev/null)
+    # shellcheck disable=SC2086  # one or more pids
+    [[ -n "$pids" ]] && { log "stopping leftover Samba (pid $pids)"; kill -TERM $pids 2>/dev/null; sleep 2; }
+    unmount_drive
+    pids=$(pgrep -f "rclone mount ${CRYPT_REMOTE}: $DRIVE_MNT" 2>/dev/null)
+    # shellcheck disable=SC2086
+    [[ -n "$pids" ]] && { log "stopping leftover rclone (pid $pids)"; kill -TERM $pids 2>/dev/null; sleep 2; }
+    return 0
+}
+
 cmd_daemon() {
-    require_root daemon
-    load_config
-    mkdir -p "$CACHE_DIR" "$DRIVE_MNT"
+    require_user; require_setup; load_config
     trap 'stop_everything; exit 0' TERM INT HUP
     log "$PROG $VERSION service starting"
-    kill_stale_server
+    rclone_patched || { log "$RCLONE is missing or lacks tm2gdrive's patches; run $PROG setup"; sleep 60; exit 1; }
+    kill_leftovers
 
-    local said_missing=""
     while :; do
-        if [[ -z "$SERVER_PID" ]] || ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            [[ -n "$SERVER_PID" ]] && log "rclone stopped unexpectedly; restarting it (the mount reconnects by itself)"
-            start_server || { sleep 10 & wait $!; continue; }
+        if [[ -z "$RCLONE_PID" ]] || ! kill -0 "$RCLONE_PID" 2>/dev/null || ! drive_mounted; then
+            [[ -n "$RCLONE_PID" ]] && log "rclone stopped unexpectedly; restarting"
+            # Samba must not serve the empty mount point.
+            stop_pid "$SMBD_PID"; SMBD_PID=""
+            stop_pid "$RCLONE_PID"; RCLONE_PID=""
+            unmount_drive
+            start_rclone || { sleep 10 & wait $!; continue; }
         fi
-        if ! drive_mounted; then
-            mount_drive || { sleep 10 & wait $!; continue; }
-        fi
-        if ! disk_attached; then
-            if [[ -d "$IMAGE" ]]; then
-                attach_disk
-                said_missing=""
-            elif [[ -z "$said_missing" ]]; then
-                log "no backup disk in the Drive folder yet (setup creates it)"
-                said_missing=1
-            fi
+        if [[ -z "$SMBD_PID" ]] || ! kill -0 "$SMBD_PID" 2>/dev/null; then
+            [[ -n "$SMBD_PID" ]] && log "Samba stopped unexpectedly; restarting"
+            start_samba || { sleep 10 & wait $!; continue; }
         fi
         sleep 10 & wait $!
     done
@@ -391,10 +445,12 @@ cmd_daemon() {
 # ---------------------------------------------------------------------------
 write_plist() {
     local extra_env="" v
-    for v in TM2GDRIVE_STATE_DIR TM2GDRIVE_CACHE_DIR TM2GDRIVE_DRIVE_MNT TM2GDRIVE_LOG TM2GDRIVE_PLIST; do
+    for v in TM2GDRIVE_STATE_DIR TM2GDRIVE_CACHE_DIR TM2GDRIVE_DRIVE_MNT TM2GDRIVE_LOG TM2GDRIVE_PLIST \
+             TM2GDRIVE_RCLONE TM2GDRIVE_SAMBA_PREFIX TM2GDRIVE_LOG_LEVEL; do
         [[ -n "${!v:-}" ]] && extra_env="$extra_env
         <key>$v</key><string>${!v}</string>"
     done
+    mkdir -p "$(dirname "$PLIST")"
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -416,8 +472,10 @@ write_plist() {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
     <key>ExitTimeOut</key>
-    <integer>120</integer>
+    <integer>90</integer>
     <key>StandardOutPath</key>
     <string>$LOG_FILE</string>
     <key>StandardErrorPath</key>
@@ -425,41 +483,248 @@ write_plist() {
 </dict>
 </plist>
 EOF
-    chown root:wheel "$PLIST"
     chmod 644 "$PLIST"
 }
 
-# The service runs as root, so it only runs root-owned copies of its programs
-# (Homebrew's folders are writable by the user).
-install_binaries() {
-    local self rclone_path
+install_self() {
+    local self
     self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-    rclone_path=$(command -v rclone) || die "rclone is not installed. Run: brew install rclone"
     mkdir -p "$BIN_DIR"
-    if ! { install -m 755 -o root -g wheel "$self" "$BIN_DIR/tm2gdrive.new" \
-           && mv -f "$BIN_DIR/tm2gdrive.new" "$BIN_DIR/tm2gdrive" \
-           && install -m 755 -o root -g wheel "$rclone_path" "$BIN_DIR/rclone.new" \
-           && mv -f "$BIN_DIR/rclone.new" "$BIN_DIR/rclone"; }; then
+    [[ "$self" == "$BIN_DIR/tm2gdrive" ]] && return 0
+    if ! { install -m 755 "$self" "$BIN_DIR/tm2gdrive.new" && mv -f "$BIN_DIR/tm2gdrive.new" "$BIN_DIR/tm2gdrive"; }; then
         die "Could not install the service."
     fi
 }
 
-service_start() {
-    service_loaded && return 0
-    launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST"
+agent_start() {
+    agent_loaded && return 0
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || launchctl load -w "$PLIST"
 }
 
-service_stop() {
-    service_loaded || return 0
-    launchctl bootout "system/$LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null
-    wait_for 130 eval '! service_loaded'
+agent_stop() {
+    agent_loaded || return 0
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null
+    wait_for 100 eval '! agent_loaded'
+}
+
+# ---------------------------------------------------------------------------
+# Setup steps
+# ---------------------------------------------------------------------------
+install_fuse_t() {
+    fuse_t_installed && { ok "FUSE-T is installed"; return 0; }
+    info "Installing FUSE-T (lets rclone show Google Drive as a folder, without kernel extensions)."
+    info "Homebrew will ask for your password."
+    brew install --cask macos-fuse-t/cask/fuse-t || die "Could not install FUSE-T."
+    fuse_t_installed || die "FUSE-T did not install."
+    ok "FUSE-T is installed"
+}
+
+install_samba() {
+    samba_prefix >/dev/null && { ok "Samba is installed"; return 0; }
+    info "Installing Samba (serves the backup folder to Time Machine, on this Mac only)..."
+    brew install samba || die "Could not install Samba."
+    samba_prefix >/dev/null || die "Samba did not install."
+    ok "Samba is installed"
+}
+
+install_rclone() {
+    if [[ -n "$TM2GDRIVE_RCLONE" ]]; then
+        rclone_patched || die "$TM2GDRIVE_RCLONE is not rclone with tm2gdrive's patches."
+        return 0
+    fi
+    local arch sum zip tmp got
+    case "$(uname -m)" in
+        arm64)  arch=arm64; sum="$RCLONE_SHA256_ARM64" ;;
+        x86_64) arch=amd64; sum="$RCLONE_SHA256_AMD64" ;;
+        *) die "Unsupported Mac: $(uname -m)" ;;
+    esac
+    if rclone_patched && [[ "$(cat "$BIN_DIR/rclone.release" 2>/dev/null)" == "$RCLONE_RELEASE" ]]; then
+        ok "rclone is installed ($RCLONE_RELEASE)"
+        return 0
+    fi
+    info "Downloading rclone with tm2gdrive's patches ($RCLONE_RELEASE)..."
+    zip="rclone-darwin-$arch.zip"
+    tmp=$(mktemp -d -t tm2gdrive) || die "Could not create a temporary folder."
+    curl -fsSL --retry 3 -o "$tmp/$zip" "https://github.com/$REPO/releases/download/$RCLONE_RELEASE/$zip" \
+        || { rm -rf "$tmp"; die "Could not download rclone."; }
+    got=$(shasum -a 256 "$tmp/$zip" | cut -d' ' -f1)
+    [[ "$got" == "$sum" ]] || { rm -rf "$tmp"; die "The rclone download is damaged or was tampered with (checksum $got)."; }
+    if ! { unzip -q -o "$tmp/$zip" -d "$tmp" && [[ -f "$tmp/rclone" ]]; }; then
+        rm -rf "$tmp"; die "Could not unpack rclone."
+    fi
+    mkdir -p "$BIN_DIR"
+    install -m 755 "$tmp/rclone" "$BIN_DIR/rclone" || { rm -rf "$tmp"; die "Could not install rclone."; }
+    rm -rf "$tmp"
+    echo "$RCLONE_RELEASE" > "$BIN_DIR/rclone.release"
+    rclone_patched || die "The downloaded rclone doesn't work."
+    ok "rclone is installed ($RCLONE_RELEASE)"
+}
+
+has_remote() {   # has_remote <name>
+    local remotes
+    remotes=$("$RCLONE" --config "$RCLONE_CONF" listremotes 2>/dev/null)
+    [[ $'\n'"$remotes"$'\n' == *$'\n'"$1:"$'\n'* ]]
+}
+
+sign_in() {   # sign_in <client id> <client secret>
+    local client_id="$1" client_secret="$2"
+    if has_remote "$DRIVE_REMOTE"; then
+        ok "Already signed in to Google Drive"
+        return 0
+    fi
+    if [[ -n "$TM2GDRIVE_DRIVE_REMOTE_CONF" ]]; then
+        # Tests: a ready-made [gdrive] remote (e.g. a local folder).
+        cat "$TM2GDRIVE_DRIVE_REMOTE_CONF" >> "$RCLONE_CONF"
+        return 0
+    fi
+    echo
+    echo "${C_BLD}Sign in to Google Drive${C_OFF}"
+    echo "Use the client ID and secret you created (README.md, step 2)."
+    [[ -n "$client_id" ]] || { printf 'Client ID: '; read -r client_id; }
+    [[ -n "$client_secret" ]] || { printf 'Client secret: '; read -r client_secret; }
+    [[ -n "$client_id" && -n "$client_secret" ]] || die "Client ID and secret are required."
+    info "A browser window will open. Sign in with the Google account that should hold the backups."
+    info "If Google says it hasn't verified the app, click Advanced, then Go to tm2gdrive (it's your own app)."
+    "$RCLONE" --config "$RCLONE_CONF" config create "$DRIVE_REMOTE" drive \
+        client_id="$client_id" client_secret="$client_secret" scope=drive.file >/dev/null \
+        || die "Signing in to Google Drive failed."
+    "$RCLONE" --config "$RCLONE_CONF" lsd "${DRIVE_REMOTE}:" >/dev/null 2>&1 \
+        || die "Signed in, but Google Drive can't be reached."
+    ok "Signed in to Google Drive"
+}
+
+# The backup password encrypts file contents and names (rclone crypt). The
+# salt is derived from it, so the password alone restores the backups.
+write_crypt_remote() {
+    "$RCLONE" --config "$RCLONE_CONF" config create "$CRYPT_REMOTE" crypt \
+        remote="${DRIVE_REMOTE}:$DRIVE_FOLDER" password="$1" password2="tm2gdrive-salt:$1" --obscure \
+        >/dev/null || die "Could not save the encryption settings."
+}
+
+backup_password() {
+    local obscured
+    obscured=$("$RCLONE" --config "$RCLONE_CONF" config show "$CRYPT_REMOTE" 2>/dev/null \
+        | awk -F' = ' '$1 == "password" { print $2 }')
+    [[ -n "$obscured" ]] && "$RCLONE" reveal "$obscured" 2>/dev/null
+}
+
+# 0: the folder has files, 1: it is empty or missing, 2: Drive can't be listed.
+drive_folder_has_backups() {
+    local out
+    if out=$("$RCLONE" --config "$RCLONE_CONF" lsf --max-depth 1 "${DRIVE_REMOTE}:$DRIVE_FOLDER" 2>&1); then
+        [[ -n "$out" ]] && return 0
+        return 1
+    fi
+    [[ "$out" == *"directory not found"* ]] && return 1
+    return 2
+}
+
+# Does the crypt remote decrypt the existing folder? With a wrong password
+# rclone skips every name (with a notice on stderr), so nothing is listed.
+crypt_password_ok() {
+    local out
+    out=$("$RCLONE" --config "$RCLONE_CONF" lsf --max-depth 1 "${CRYPT_REMOTE}:" 2>/dev/null) || return 1
+    [[ -n "$out" ]]
+}
+
+set_up_encryption() {
+    if has_remote "$CRYPT_REMOTE"; then
+        ok "Encryption is set up"
+        return 0
+    fi
+    local pw tries=0 found
+    drive_folder_has_backups
+    found=$?
+    if [[ $found -eq 0 ]]; then
+        info "Found existing backups in the Google Drive folder \"$DRIVE_FOLDER\"."
+        while :; do
+            if [[ -n "$TM2GDRIVE_BACKUP_PASSWORD" ]]; then
+                pw="$TM2GDRIVE_BACKUP_PASSWORD"
+            else
+                printf 'Enter their backup password: '
+                read -rs pw || die "No password entered."
+                echo
+            fi
+            write_crypt_remote "$pw"
+            crypt_password_ok && break
+            "$RCLONE" --config "$RCLONE_CONF" config delete "$CRYPT_REMOTE" >/dev/null 2>&1
+            tries=$((tries + 1))
+            [[ -n "$TM2GDRIVE_BACKUP_PASSWORD" || $tries -ge 3 ]] && die "That password doesn't decrypt the backups."
+            warn "That password doesn't decrypt the backups. Try again."
+        done
+        ok "Backup password accepted"
+        return 0
+    fi
+    [[ $found -eq 1 ]] || die "Can't read the Google Drive folder \"$DRIVE_FOLDER\". Check your connection and run setup again."
+
+    pw="${TM2GDRIVE_BACKUP_PASSWORD:-}"
+    if [[ -z "$pw" ]]; then
+        pw=$(openssl rand -base64 48 | tr -d '\n/+=' | cut -c1-32)
+        [[ ${#pw} -ge 32 ]] || die "Could not generate a password."
+    fi
+    write_crypt_remote "$pw"
+    "$RCLONE" --config "$RCLONE_CONF" mkdir "${CRYPT_REMOTE}:" || die "Could not create the Google Drive folder."
+    [[ -n "$TM2GDRIVE_BACKUP_PASSWORD" ]] && return 0
+    echo
+    echo "${C_BLD}${C_YEL}IMPORTANT: your backup password${C_OFF}"
+    echo
+    echo "    ${C_BLD}$pw${C_OFF}"
+    echo
+    echo "Your backups are encrypted with it before they reach Google, and you need it"
+    echo "to restore onto another Mac. Save it in your password manager now."
+    echo "(Show it again on this Mac with: $PROG password)"
+    echo
+    while :; do
+        confirm "I have saved the password somewhere outside this Mac." && break
+        [[ $? -eq 2 ]] && die "No answer received. Run \"$PROG setup\" again in a terminal."
+    done
+}
+
+set_up_samba_account() {
+    local prefix pw
+    prefix=$(samba_prefix) || die "Samba is not installed."
+    write_smb_conf
+    if [[ ! -s "$SMB_PASSWORD_FILE" ]]; then
+        pw=$(openssl rand -hex 16) || die "Could not generate a password."
+        printf '%s' "$pw" > "$SMB_PASSWORD_FILE"
+        chmod 600 "$SMB_PASSWORD_FILE"
+    fi
+    pw=$(cat "$SMB_PASSWORD_FILE")
+    # pdbedit, unlike smbpasswd -a, works without root.
+    "$prefix/bin/pdbedit" -s "$SMB_CONF" -x -u "$(id -un)" >/dev/null 2>&1
+    printf '%s\n%s\n' "$pw" "$pw" | "$prefix/bin/pdbedit" -s "$SMB_CONF" -a -u "$(id -un)" -t >/dev/null 2>&1 \
+        || die "Could not create the Samba account."
+}
+
+add_time_machine_destination() {
+    if [[ -n "$(tm_destination_id)" ]]; then
+        ok "Time Machine already backs up to \"$SHARE\""
+        return 0
+    fi
+    has_full_disk_access || {
+        warn "Your terminal app may not have Full Disk Access. Time Machine needs it to accept the backup disk."
+        echo "    $FDA_HELP"
+    }
+    local pw tm_err
+    pw=$(cat "$SMB_PASSWORD_FILE")
+    info "Adding the backup disk to Time Machine (macOS asks for your password)..."
+    if tm_err=$(sudo tmutil setdestination -a "smb://$SMB_USER:$pw@127.0.0.1:$SMB_PORT/$SHARE" 2>&1); then
+        sudo tmutil enable 2>/dev/null
+        ok "Time Machine now backs up to \"$SHARE\" every hour"
+        return 0
+    fi
+    err "Time Machine did not accept the backup disk: ${tm_err//$pw/***}"
+    echo "    Everything else is ready. The usual cause is missing Full Disk Access:"
+    echo "    $FDA_HELP"
+    echo "    If it is on and this keeps happening, please report the message at"
+    echo "    https://github.com/$REPO/issues"
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
+    exit 1
 }
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-
-# Part 1 (as the user): Google sign-in, which needs the user's browser.
 cmd_setup() {
     local client_id="" client_secret=""
     while [[ $# -gt 0 ]]; do
@@ -470,207 +735,55 @@ cmd_setup() {
         esac
         shift
     done
-    require_macos
-    [[ $EUID -eq 0 && -n "$SUDO_USER" ]] && die "Run setup as your normal user, without sudo."
-
+    require_macos; require_user
     echo "${C_BLD}$PROG setup${C_OFF}: Time Machine backups to Google Drive"
     echo
-
-    if ! has_full_disk_access; then
-        warn "Your terminal app may not have Full Disk Access. Time Machine needs it to accept the backup disk."
-        echo "    If setup fails at the Time Machine step: $FDA_HELP"
-        echo
-    fi
-
-    if ! command -v rclone >/dev/null 2>&1; then
-        command -v brew >/dev/null 2>&1 || die "Install Homebrew (https://brew.sh), then run: brew install rclone"
-        info "Installing rclone..."
-        brew install rclone || die "Could not install rclone."
-    fi
-    rclone_ok rclone || die "rclone is too old. Run: brew upgrade rclone"
-    ok "$(rclone version | head -1)"
-
-    info "Administrator rights are needed to install the background service."
-    sudo -v || die "Administrator rights are required."
-
-    local conf=""
-    if [[ -n "$TM2GDRIVE_RCLONE_CONF" ]]; then
-        conf="$TM2GDRIVE_RCLONE_CONF"
-    elif sudo test -f "$RCLONE_CONF"; then
-        ok "Already signed in to Google Drive"
-    else
-        echo
-        echo "${C_BLD}Sign in to Google Drive${C_OFF}"
-        echo "Use the client ID and secret you created (README.md, step 2)."
-        [[ -n "$client_id" ]] || { printf 'Client ID: '; read -r client_id; }
-        [[ -n "$client_secret" ]] || { printf 'Client secret: '; read -r client_secret; }
-        [[ -n "$client_id" && -n "$client_secret" ]] || die "Client ID and secret are required."
-        conf=$(mktemp -t tm2gdrive-rclone) || die "Could not create a temporary file."
-        info "A browser window will open. Sign in with the Google account that should hold the backups."
-        info "If Google says it hasn't verified the app, click Advanced, then Go to tm2gdrive (it's your own app)."
-        RCLONE_CONFIG="$conf" rclone config create "$RCLONE_REMOTE" drive \
-            client_id="$client_id" client_secret="$client_secret" scope=drive.file >/dev/null \
-            || { rm -f "$conf"; die "Signing in to Google Drive failed."; }
-        RCLONE_CONFIG="$conf" rclone lsd "${RCLONE_REMOTE}:" >/dev/null 2>&1 \
-            || { rm -f "$conf"; die "Signed in, but Google Drive can't be reached."; }
-        ok "Signed in to Google Drive"
-    fi
-
-    # Part 2 runs as root. sudo drops the environment, so pass the test hooks on.
-    local envs=() v rc
-    for v in TM2GDRIVE_STATE_DIR TM2GDRIVE_CACHE_DIR TM2GDRIVE_DRIVE_MNT TM2GDRIVE_LOG TM2GDRIVE_PLIST \
-             TM2GDRIVE_DISK_PASSWORD TM2GDRIVE_DISK_SIZE_GB TM2GDRIVE_DRIVE_FOLDER TM2GDRIVE_ASSUME_YES \
-             TM2GDRIVE_SKIP_TIME_MACHINE TM2GDRIVE_SKIP_FDA_CHECK; do
-        [[ -n "${!v:-}" ]] && envs+=("$v=${!v}")
-    done
-    sudo env ${envs[@]+"${envs[@]}"} /bin/bash "$0" _setup-root "$conf"
-    rc=$?
-    [[ -n "$conf" && "$conf" != "$TM2GDRIVE_RCLONE_CONF" ]] && rm -f "$conf"
-    return $rc
-}
-
-# Size for a new backup disk: twice the Mac's data, within what Drive can hold.
-choose_disk_size() {
-    local free="$1" need_b="$2" size cap
-    size=$(( need_b * 2 / 1000000000 ))
-    [[ $size -lt 200 ]] && size=200
-    if [[ -n "$free" ]]; then
-        cap=$(( free * 9 / 10 / 1000000000 ))
-        [[ $size -gt $cap ]] && size=$cap
-    fi
-    # 16 MiB bands keep a 7 TB disk under Drive's 500,000 files per folder.
-    [[ $size -gt 7000 ]] && size=7000
-    echo "$size"
-}
-
-# Part 2 (as root): service, backup disk, Time Machine.
-cmd_setup_root() {
-    local conf="$1"
-    require_macos; require_root setup
-    load_config
+    command -v brew >/dev/null 2>&1 || die "Install Homebrew (https://brew.sh), then run this again."
     umask 077
-    mkdir -p "$STATE_DIR" "$CACHE_DIR"
+    mkdir -p "$STATE_DIR" "$CACHE_DIR" "$(dirname "$LOG_FILE")"
     chmod 700 "$STATE_DIR"
-    [[ -n "$TM2GDRIVE_DRIVE_FOLDER" ]] && DRIVE_FOLDER="$TM2GDRIVE_DRIVE_FOLDER"
-    if [[ -n "$conf" ]]; then
-        install -m 600 -o root -g wheel "$conf" "$RCLONE_CONF" || die "Could not save the Google sign-in."
-    fi
-    [[ -f "$RCLONE_CONF" ]] || die "Not signed in to Google Drive. Run $PROG setup again."
+    load_config
+
+    install_fuse_t
+    install_samba
+    install_rclone
+    sign_in "$client_id" "$client_secret"
+    set_up_encryption
 
     local free used_kb need_b
-    free=$(rclone --config "$RCLONE_CONF" about "${RCLONE_REMOTE}:" --json 2>/dev/null \
-        | grep -oE '"free":[[:space:]]*[0-9]+' | grep -oE '[0-9]+$')
+    free=$(drive_free_bytes)
     used_kb=$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR == 2 { print $3 }')
     [[ "$used_kb" =~ ^[0-9]+$ ]] || used_kb=$(df -k / | awk 'NR == 2 { print $3 }')
     need_b=$((used_kb * 1024))
     [[ -n "$free" ]] && info "Google Drive has $(human_gb "$free") free. This Mac holds $(human_gb "$need_b") of data."
-    if [[ -n "$TM2GDRIVE_DISK_SIZE_GB" ]]; then
-        DISK_SIZE_GB="$TM2GDRIVE_DISK_SIZE_GB"
-    elif [[ "$DISK_SIZE_GB" -eq 0 ]]; then
-        DISK_SIZE_GB=$(choose_disk_size "$free" "$need_b")
+    [[ $BACKUP_SIZE_GB -eq 0 ]] && BACKUP_SIZE_GB=$(choose_backup_size "$free" "$need_b")
+    [[ $BACKUP_SIZE_GB -ge 1 ]] || die "Not enough free space in Google Drive."
+    if [[ $((BACKUP_SIZE_GB * 1000000000)) -lt $need_b ]]; then
+        warn "Google Drive has less free space than this Mac's data; the first backup may not fit."
     fi
-    [[ $DISK_SIZE_GB -ge 1 ]] || die "Not enough free space in Google Drive."
     write_config
+    set_up_samba_account
 
-    # The first backup is written to the local cache faster than it uploads.
-    local local_free_kb
-    local_free_kb=$(df -k "$(dirname "$CACHE_DIR")" | awk 'NR == 2 { print $4 }')
-    if [[ "$local_free_kb" =~ ^[0-9]+$ && $((local_free_kb * 1024)) -lt $need_b ]]; then
-        warn "This Mac has $(human_gb $((local_free_kb * 1024))) free. The first backup is held on the Mac until it is"
-        warn "uploaded, so on a slow connection it can temporarily need up to that much space."
-    fi
-
-    info "Installing the background service..."
-    service_stop
-    install_binaries
+    info "Starting the background service..."
+    agent_stop
+    install_self
     write_plist
     touch "$LOG_FILE"
-    service_start || die "Could not start the background service. See $LOG_FILE"
-    wait_for 90 drive_mounted || die "Google Drive did not mount. See $LOG_FILE"
-    ok "Google Drive is mounted"
+    agent_start || die "Could not start the background service. See $LOG_FILE"
+    wait_for 90 smb_listening || die "The backup share did not start. See: $PROG logs"
+    ok "Encrypted Google Drive folder \"$DRIVE_FOLDER\" is ready (Time Machine limit: ${BACKUP_SIZE_GB} GB)"
 
-    if [[ -d "$IMAGE" ]]; then
-        info "Found an existing backup disk in the Google Drive folder \"$DRIVE_FOLDER\"."
-        if [[ ! -f "$PASSWORD_FILE" ]]; then
-            local pw tries=0
-            while :; do
-                if [[ -n "$TM2GDRIVE_DISK_PASSWORD" ]]; then
-                    pw="$TM2GDRIVE_DISK_PASSWORD"
-                else
-                    printf 'Enter the backup disk password: '
-                    read -rs pw || die "No password entered."
-                    echo
-                fi
-                printf '%s' "$pw" > "$PASSWORD_FILE"
-                wait_for 60 disk_attached && break
-                tries=$((tries + 1))
-                rm -f "$PASSWORD_FILE"
-                [[ -n "$TM2GDRIVE_DISK_PASSWORD" || $tries -ge 3 ]] && die "That password didn't open the backup disk."
-                warn "That password didn't open the backup disk. Try again."
-            done
-        fi
-    else
-        local pw="${TM2GDRIVE_DISK_PASSWORD:-}"
-        if [[ -z "$pw" ]]; then
-            pw=$(openssl rand -base64 48 | tr -d '\n/+=' | cut -c1-32)
-            [[ ${#pw} -ge 32 ]] || die "Could not generate a password."
-        fi
-        printf '%s' "$pw" > "$PASSWORD_FILE"
-        info "Creating an encrypted ${DISK_SIZE_GB} GB backup disk in Google Drive (it only uses space as it fills)..."
-        if ! printf '%s' "$pw" | hdiutil create -size "${DISK_SIZE_GB}g" -type SPARSEBUNDLE -fs APFS \
-            -volname "$VOLUME_NAME" -encryption AES-256 -stdinpass \
-            -imagekey sparse-band-size="$BAND_SECTORS" "$IMAGE" >/dev/null; then
-            rm -rf "$IMAGE" "$PASSWORD_FILE"
-            die "Could not create the backup disk. See $LOG_FILE"
-        fi
-        if [[ -z "$TM2GDRIVE_DISK_PASSWORD" ]]; then
-            echo
-            echo "${C_BLD}${C_YEL}IMPORTANT: your backup disk password${C_OFF}"
-            echo
-            echo "    ${C_BLD}$pw${C_OFF}"
-            echo
-            echo "Your backups are encrypted with it before they reach Google, and you need it"
-            echo "to restore onto another Mac. Save it in your password manager now."
-            echo
-            while :; do
-                confirm "I have saved the password somewhere outside this Mac." && break
-                [[ $? -eq 2 ]] && die "No answer received. Run \"$PROG setup\" again in a terminal."
-            done
-        fi
-    fi
-    wait_for 120 volume_mounted || die "The backup disk did not attach. See $LOG_FILE"
-    ok "Backup disk \"$VOLUME_NAME\" is attached"
-
-    if [[ -n "$TM2GDRIVE_SKIP_TIME_MACHINE" ]]; then
-        :
-    elif [[ -n "$(tm_destination_id)" ]]; then
-        ok "Time Machine already backs up to \"$VOLUME_NAME\""
-    else
-        # Time Machine's "Add Backup Disk" list never shows disk images, so
-        # this has to work from the command line.
-        local tm_err
-        if tm_err=$(tmutil setdestination -a "$VOLUME" 2>&1); then
-            tmutil enable 2>/dev/null
-            tmutil addexclusion -p "$CACHE_DIR" 2>/dev/null
-            ok "Time Machine now backs up to \"$VOLUME_NAME\" every hour"
-        else
-            err "Time Machine did not accept \"$VOLUME_NAME\": ${tm_err:-no reason given}"
-            echo "    The backup disk itself is ready. The usual cause is missing Full Disk Access:"
-            echo "    $FDA_HELP"
-            echo "    If it is on and this keeps happening, please report the message at"
-            echo "    https://github.com/nooranshdhaka/time-machine-to-google-drive/issues"
-            open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
-            exit 1
-        fi
-    fi
+    [[ -n "$TM2GDRIVE_SKIP_TIME_MACHINE" ]] || add_time_machine_destination
 
     echo
     ok "Setup complete."
-    echo "    Time Machine backs up to \"$VOLUME_NAME\" automatically. Use the Time Machine app as usual."
-    echo "    See whether everything has reached Google Drive with: $PROG status"
-    if [[ -z "$TM2GDRIVE_SKIP_TIME_MACHINE" && -n "$(tm_destination_id)" ]] \
-        && confirm "Start the first backup now?"; then
-        if tmutil startbackup --auto 2>/dev/null; then
+    echo "    Time Machine backs up to \"$SHARE\" every hour. Use the Time Machine app as usual."
+    echo "    The first backup uploads everything and can take a day or more; it carries on"
+    echo "    after sleep and restarts. Check progress with: $PROG status"
+    local id=""
+    [[ -z "$TM2GDRIVE_SKIP_TIME_MACHINE" ]] && id=$(tm_destination_id)
+    if [[ -n "$id" ]] && confirm "Start the first backup now?"; then
+        if tmutil startbackup --destination "$id" 2>/dev/null; then
             ok "First backup started."
         else
             info "Time Machine will start the first backup by itself within the hour."
@@ -681,31 +794,31 @@ cmd_setup_root() {
 
 cmd_status() {
     [[ $# -eq 0 ]] || die "status takes no options."
-    require_macos; require_root status; require_setup; load_config
-    local problems=0 pending used free
+    require_macos; require_user; require_setup; load_config
+    local problems=0 pending free
 
-    if service_loaded; then ok "Background service is running"; else err "Background service is not running (start it: $PROG start)"; problems=1; fi
-    if drive_mounted; then ok "Google Drive folder \"$DRIVE_FOLDER\" is mounted"; else err "Google Drive is not mounted (see: $PROG logs)"; problems=1; fi
-    if volume_mounted; then
-        used=$(df -h "$VOLUME" | awk 'NR == 2 { print $3 " used of " $2 }')
-        ok "Backup disk \"$VOLUME_NAME\" is attached ($used)"
-    else
-        err "Backup disk \"$VOLUME_NAME\" is not attached (see: $PROG logs)"; problems=1
-    fi
+    if agent_loaded; then ok "Background service is running"; else err "Background service is not running (start it: $PROG start)"; problems=1; fi
+    if drive_mounted; then ok "Encrypted Google Drive folder \"$DRIVE_FOLDER\" is mounted"; else err "Google Drive is not mounted (see: $PROG logs)"; problems=1; fi
+    if smb_listening; then ok "Time Machine share is up (127.0.0.1:$SMB_PORT)"; else err "Time Machine share is down (see: $PROG logs)"; problems=1; fi
     if [[ -n "$(tm_destination_id)" ]]; then
-        ok "Time Machine backs up to it"
+        ok "Time Machine backs up to \"$SHARE\""
     else
-        warn "Time Machine isn't using \"$VOLUME_NAME\" yet (System Settings > General > Time Machine)"
+        warn "Time Machine isn't using \"$SHARE\" (run: $PROG setup)"
     fi
     tm_running && info "A Time Machine backup is running now"
 
     pending=$(pending_uploads)
     if [[ -z "$pending" ]]; then
         warn "Upload status unavailable"
-    elif [[ "$pending" -eq 0 ]]; then
-        ok "Everything is uploaded to Google Drive"
     else
-        info "Uploading: $pending file(s) still on their way to Google Drive"
+        local files bytes open
+        read -r files bytes open <<<"$pending"
+        if [[ $files -eq 0 ]]; then
+            ok "Everything is uploaded to Google Drive"
+        else
+            info "Uploading: $files file(s), $(human_gb "$bytes"), still on their way to Google Drive"
+        fi
+        [[ $open -gt 0 ]] && info "$open file(s) are still open; they upload once they are closed"
     fi
     free=$(drive_free_bytes)
     [[ -n "$free" ]] && info "Google Drive free space: $(human_gb "$free")"
@@ -713,21 +826,21 @@ cmd_status() {
 }
 
 cmd_start() {
-    require_macos; require_root start; require_setup
-    service_start || die "Could not start the service."
+    require_macos; require_user; require_setup
+    agent_start || die "Could not start the service."
     ok "Started."
 }
 
 cmd_stop() {
-    require_macos; require_root stop
-    service_stop
-    ok "Stopped. The backup disk is detached; anything not yet uploaded is sent on the next start."
+    require_macos; require_user
+    agent_stop
+    ok "Stopped. Anything not yet uploaded is sent on the next start."
 }
 
 cmd_restart() {
-    require_macos; require_root restart; require_setup
-    service_stop
-    service_start || die "Could not start the service."
+    require_macos; require_user; require_setup
+    agent_stop
+    agent_start || die "Could not start the service."
     ok "Restarted."
 }
 
@@ -741,18 +854,18 @@ cmd_logs() {
 }
 
 cmd_reconnect() {
-    require_macos
-    [[ $EUID -eq 0 && -n "$SUDO_USER" ]] && die "Run reconnect as your normal user, without sudo."
-    sudo test -f "$RCLONE_CONF" || die "$PROG is not set up yet. Run: $PROG setup"
-    local tmp
-    tmp=$(mktemp -t tm2gdrive-rclone) || die "Could not create a temporary file."
-    # shellcheck disable=SC2024  # the copy is meant to be owned by the user
-    sudo cat "$RCLONE_CONF" > "$tmp" || { rm -f "$tmp"; die "Could not read the settings."; }
+    require_macos; require_user; require_setup
     info "A browser window will open. Sign in with the Google account that holds the backups."
-    RCLONE_CONFIG="$tmp" rclone config reconnect "${RCLONE_REMOTE}:" || { rm -f "$tmp"; die "Reconnecting failed."; }
-    sudo install -m 600 -o root -g wheel "$tmp" "$RCLONE_CONF"
-    rm -f "$tmp"
-    sudo /bin/bash "$0" restart
+    "$RCLONE" --config "$RCLONE_CONF" config reconnect "${DRIVE_REMOTE}:" || die "Reconnecting failed."
+    cmd_restart
+}
+
+cmd_password() {
+    require_macos; require_user; require_setup
+    local pw
+    pw=$(backup_password)
+    [[ -n "$pw" ]] || die "Could not read the backup password."
+    echo "$pw"
 }
 
 cmd_uninstall() {
@@ -762,45 +875,53 @@ cmd_uninstall() {
         --purge) purge=1 ;;
         *) die "Unknown option for uninstall: $1" ;;
     esac
-    require_macos; require_root uninstall
+    require_macos; require_user
     load_config
+    if [[ -n "$purge" && -f "$RCLONE_CONF" ]]; then
+        echo "--purge deletes the Google sign-in and the backup password from this Mac."
+        confirm "Have you saved the backup password elsewhere? (show it with: $PROG password)" \
+            || die "Nothing was removed. Save the password, then run uninstall --purge again."
+    fi
     local id
     id=$(tm_destination_id)
     if [[ -n "$id" ]]; then
-        tmutil removedestination "$id" 2>/dev/null && ok "Removed \"$VOLUME_NAME\" from Time Machine"
+        info "Removing \"$SHARE\" from Time Machine (macOS asks for your password)..."
+        sudo tmutil removedestination "$id" 2>/dev/null && ok "Removed \"$SHARE\" from Time Machine"
     fi
-    service_stop
+    agent_stop
     rm -f "$PLIST"
     rm -rf "$BIN_DIR"
     ok "Background service removed"
     if [[ -n "$purge" ]]; then
         rm -rf "$STATE_DIR" "$CACHE_DIR"
-        ok "Settings, the stored disk password and the cache are deleted from this Mac"
+        ok "Settings, the backup password and the cache are deleted from this Mac"
     else
-        info "Settings and the disk password stay in \"$STATE_DIR\" (remove them with: $PROG uninstall --purge)"
+        info "Settings and the backup password stay in \"$STATE_DIR\" (remove them with: $PROG uninstall --purge)"
     fi
     info "Your backups stay in the Google Drive folder \"$DRIVE_FOLDER\"."
+    info "FUSE-T and Samba stay installed (brew uninstall --cask fuse-t; brew uninstall samba)."
 }
 
 usage() {
     cat <<EOF
-$PROG $VERSION - use Google Drive as a Time Machine backup disk
+$PROG $VERSION - Time Machine backups to Google Drive, encrypted on your Mac
 
 Usage: $PROG <command>
 
-  setup          Sign in to Google Drive and set everything up (run once)
+  setup          Install, sign in to Google Drive and add the Time Machine disk (run once)
   status         Is everything running, and has everything reached Google Drive?
   logs [-f]      Show the service log (-f to keep following it)
+  password       Show the backup password (needed to restore on another Mac)
   reconnect      Sign in to Google again (if the sign-in expired)
   restart        Restart the background service (after editing settings)
   stop | start   Stop or start the background service
   uninstall      Remove the service and the Time Machine disk (your backups stay in Drive)
-      --purge      Also delete the settings, the stored disk password and the cache
+      --purge      Also delete the settings, the backup password and the cache
   version        Print the version
 
 Settings: $CONFIG_FILE
 Log:      $LOG_FILE
-Docs:     https://github.com/nooranshdhaka/time-machine-to-google-drive
+Docs:     https://github.com/$REPO
 EOF
 }
 
@@ -808,14 +929,8 @@ main() {
     local cmd="${1:-help}"
     [[ $# -gt 0 ]] && shift
     case "$cmd" in
-        setup)        cmd_setup "$@" ;;
-        _setup-root)  cmd_setup_root "$@" ;;
-        reconnect)    cmd_reconnect "$@" ;;
-        status|start|stop|restart|uninstall)
-            ensure_root "$cmd" "$@"
+        setup|status|start|stop|restart|reconnect|password|uninstall|daemon|logs)
             "cmd_$cmd" "$@" ;;
-        logs)         cmd_logs "$@" ;;
-        daemon)       cmd_daemon "$@" ;;
         version|--version|-v) echo "$PROG $VERSION" ;;
         help|--help|-h) usage ;;
         *) usage >&2; exit 1 ;;

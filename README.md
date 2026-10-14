@@ -1,33 +1,33 @@
 # tm2gdrive
 
-**Use Google Drive as your Time Machine backup disk.** No external drive, no NAS.
+**Time Machine backups to Google Drive, encrypted on your Mac.** No external
+drive, no NAS.
 
 [![CI](https://github.com/nooranshdhaka/time-machine-to-google-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/nooranshdhaka/time-machine-to-google-drive/actions/workflows/ci.yml)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-`tm2gdrive` adds a backup disk called **Google Drive Backup** to your Mac. It
-behaves like a plugged-in drive, but everything on it is stored in your
-Google Drive. Time Machine backs up to it every hour, and you keep using the
-Time Machine app as before: enter Time Machine, scroll back through time,
-and restore any file or folder.
+`tm2gdrive` gives Time Machine a network backup disk called **tm2gdrive**
+whose contents live in your Google Drive. Time Machine backs up to it every
+hour, and you keep using the Time Machine app as before.
 
 - **Everything stays Time Machine:** hourly backups, the Time Machine app,
-  Finder restores and Migration Assistant.
-- **Encrypted on your Mac.** The backup disk is an AES-256 encrypted disk
-  image, so Google only ever stores scrambled data.
-- **Nothing to plug in.** A small background service keeps the disk mounted
-  through restarts, sleep and Wi-Fi changes.
-- **Resilient.** Backups land on the Mac first and upload in the background.
-  If the Mac is offline or restarts, uploads pick up where they left off.
-- **One command to set up.** It uses only macOS's built-in NFS client and
-  [rclone](https://rclone.org): no kernel extensions, no virtual machines.
+  browsing and restoring old versions.
+- **Encrypted before upload.** File contents and names are encrypted on your
+  Mac with a password only you have. Google only ever stores scrambled data.
+- **Doesn't fill your Mac.** Backups wait on the Mac only until they're
+  uploaded. When too much is waiting (5 GB by default), Time Machine simply
+  slows down to your upload speed.
+- **Runs as you, not as root.** No kernel extensions, no virtual machine, no
+  system service. Administrator rights are only needed during setup.
+- **One command to set up:** `tm2gdrive setup`.
 
-> **Status: new.** The full chain (service, Drive mount, encrypted disk,
-> restarts, crash recovery, reading back from Drive) is tested on a real Mac in
-> CI on every change. Time Machine's own backup engine can't run on CI
-> machines, so keep your existing backup until you've seen a few hourly
-> backups complete and tried a restore.
+> **Status: new (3.0).** Real Time Machine backups to real Google Drive work,
+> including picking up again after a restart with an empty cache. CI tests
+> the whole chain on a Mac on every change, apart from Time Machine itself,
+> which can't run on CI machines. Restoring a complete backup hasn't been
+> tested end to end yet, so keep your existing backup until you've restored
+> some files from this one.
 
 ## Contents
 
@@ -38,39 +38,45 @@ and restore any file or folder.
 - [Settings](#settings)
 - [Troubleshooting](#troubleshooting)
 - [Uninstall](#uninstall)
+- [Upgrading from 2.x](#upgrading-from-2x)
 - [Development](#development)
 
 ## How it works
 
 ```
-Time Machine ──hourly──▶ "Google Drive Backup"   (encrypted APFS disk image, attached like a USB drive)
+Time Machine ──hourly──▶ smb://127.0.0.1:44545/tm2gdrive    (Samba, on this Mac only)
                                 │
-                                ▼  stored as 16 MB "band" files in
-                        /private/var/tm2gdrive/drive   (your Drive folder, mounted over NFS on 127.0.0.1)
-                                │
-                                ▼  rclone: local cache → background upload
-                         Google Drive  ›  tm2gdrive/TimeMachine.sparsebundle
+                                ▼
+                 ~/Library/Application Support/tm2gdrive/drive
+                                │   rclone mount (FUSE-T): encrypts, keeps changed
+                                ▼   files on the Mac until they're uploaded
+                 Google Drive  ›  tm2gdrive-backups   (encrypted names and contents)
 ```
 
-1. **rclone serves your Drive folder** to the Mac over NFS, on the local
-   machine only (127.0.0.1). macOS mounts it with its built-in NFS client.
-2. **A sparse bundle disk image lives in that folder.** It's an encrypted
-   APFS disk stored as many 16 MB files. Only the files that change are
-   uploaded, and empty space takes up nothing.
-3. **The image is attached as a normal disk** and set as a Time Machine
-   destination, next to any disk you already use.
-4. **Writes go to a local cache first.** rclone uploads each changed band
-   about 30 seconds after Time Machine stops writing to it. Anything not yet
-   uploaded survives restarts and crashes and is sent later. Reads come from
-   the cache or are downloaded from Drive on demand.
-5. **A LaunchDaemon** (`io.github.nooranshdhaka.tm2gdrive`) keeps it all
-   running. If rclone ever stops, it is restarted, and the disk carries on:
-   the NFS mount waits for it instead of failing.
+1. **Samba shares a folder as a Time Machine disk**, on 127.0.0.1 only, so
+   nothing on your network can reach it. Time Machine treats it like a NAS:
+   it keeps its backups in a disk image (a "sparse bundle") stored as many
+   ~100 MB "band" files.
+2. **That folder is your Google Drive folder,** mounted by
+   [rclone](https://rclone.org) with
+   [FUSE-T](https://www.fuse-t.org) (no kernel extension). rclone's
+   [crypt](https://rclone.org/crypt/) layer encrypts every file and file
+   name before it leaves the Mac.
+3. **Changed bands are uploaded in the background** shortly after Time
+   Machine finishes with them. Anything not yet uploaded survives restarts
+   and crashes and is sent later. If too much is waiting, writes pause
+   until uploads catch up, so the first backup never fills your disk.
+4. **A LaunchAgent** (`io.github.nooranshdhaka.tm2gdrive`) keeps rclone and
+   Samba running while you're logged in, and restarts them if they stop.
+
+tm2gdrive uses a build of rclone with a few fixes that Time Machine needs
+([rclone/README.md](rclone/README.md)). GitHub Actions builds it from
+rclone's source, and setup checks its checksum.
 
 ## Setup
 
 You need macOS 13 or later, [Homebrew](https://brew.sh), and a Google
-account with enough Drive storage (about twice the data on your Mac is ideal).
+account with enough Drive storage: about 1.5 times the data on your Mac.
 
 ### 1. Install
 
@@ -119,9 +125,8 @@ Open **System Settings → Privacy & Security → Full Disk Access** and turn on
 **Applications → Utilities**. Then **quit the terminal (⌘Q) and open it
 again**.
 
-Why: Time Machine's **Add Backup Disk** list never offers disk images, so
-setup adds the disk with Apple's `tmutil` command. macOS only allows that
-from an app with Full Disk Access.
+Why: setup adds the backup disk with Apple's `tmutil` command, and macOS
+only allows that from an app with Full Disk Access.
 
 ### 4. Run setup
 
@@ -129,24 +134,20 @@ from an app with Full Disk Access.
 tm2gdrive setup
 ```
 
-Setup asks for:
+Setup:
 
-- The client ID and secret. A browser opens: sign in with your Google
-  account and allow access.
-- Your Mac password, once. It's needed to install the background service.
+- installs FUSE-T (Homebrew asks for your Mac password), Samba, and the
+  patched rclone
+- asks for the client ID and secret, and opens a browser to sign in to
+  Google
+- creates the encrypted folder `tm2gdrive-backups` in your Drive and shows
+  you the **backup password**. **Save it in your password manager:** you
+  need it to restore onto another Mac.
+- starts the background service and adds **tm2gdrive** to Time Machine
+  (asks for your Mac password), then offers to start the first backup
 
-Then it:
-
-- creates the encrypted backup disk in Google Drive, sized at about twice
-  your Mac's data (space is only used as it fills)
-- shows you the **backup disk password**: **save it in your password
-  manager**, because you need it to restore onto another Mac
-- adds **Google Drive Backup** to Time Machine and offers to start the first
-  backup
-
-**Google Drive Backup** then shows up in **System Settings → General → Time
-Machine**, next to any disks you already use. Don't look for it under **Add
-Backup Disk**: that list never shows disk images.
+**tm2gdrive** then shows up in **System Settings → General → Time Machine**,
+next to any disks you already use.
 
 ## Using it
 
@@ -155,43 +156,50 @@ There's nothing to do: Time Machine backs up every hour by itself.
 ```bash
 tm2gdrive status      # is everything running, and has it all reached Google Drive?
 tm2gdrive logs        # what the background service has been doing
+tm2gdrive password    # show the backup password
 ```
 
-- **The first backup** is the big one: about the size of your data. It's
-  written to the Mac first and uploaded as fast as your connection and
-  Google allow (Google caps uploads at 750 GB a day). Leave the Mac on and
-  connected until `tm2gdrive status` says **Everything is uploaded**.
-- **Hourly backups** are small and upload within minutes.
-- **Offline?** Time Machine still backs up, into the local cache, and
-  everything uploads once you're back online.
+- **The first backup** is the big one: about the size of your data, uploaded
+  as fast as your connection allows (Google caps uploads at 750 GB a day).
+  At 40 Mbit/s, 300 GB takes about 17 hours. It carries on after sleep and
+  restarts.
+- **Hourly backups** only upload the bands that changed, usually within
+  minutes.
+- **The Mac's disk:** at most about 15 GB is used: up to 5 GB waiting to
+  upload, up to 5 GB of recent data kept for speed, and the bands Time
+  Machine has open.
 - **Restoring:** use Time Machine as usual (Time Machine in the menu bar →
-  **Browse Time Machine Backups**). Files that aren't cached are downloaded
-  from Drive, so browsing old backups can be slower than a USB drive.
+  **Browse Time Machine Backups**). Older data is downloaded from Drive, so
+  it's slower than a USB drive.
+- **Logged out?** The service runs while you're logged in. Time Machine
+  backs up during that time, and also during Power Nap.
 
 ## Restoring on a new Mac
 
 1. Install tm2gdrive ([steps 1–3](#setup), reusing your client ID).
-2. Run `tm2gdrive setup`. It finds the existing backup disk in your Drive and
-   asks for the **backup disk password**.
-3. The disk appears as **Google Drive Backup**. Then either:
-   - open **Migration Assistant** and choose **From a Mac, Time Machine
-     backup or startup disk** to bring everything over, or
-   - use **Browse Time Machine Backups** to pick out files.
+2. Run `tm2gdrive setup`. It finds the existing backups in your Drive and
+   asks for the **backup password**.
+3. Time Machine now lists **tm2gdrive** with your old Mac's backups. Use
+   **Browse Time Machine Backups** to restore files.
 
 ## Settings
 
-Settings are in `/Library/Application Support/tm2gdrive/config`. Edit them
-with `sudo nano`, then run `tm2gdrive restart`.
+Settings are in `~/Library/Application Support/tm2gdrive/config`. After
+editing them, run `tm2gdrive restart`.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `DRIVE_FOLDER` | `tm2gdrive` | Google Drive folder that holds the backup disk |
-| `VOLUME_NAME` | `Google Drive Backup` | Name of the disk in Finder and Time Machine (set before the first setup) |
-| `DISK_SIZE_GB` | twice your data | Maximum size of the backup disk. Time Machine deletes the oldest backups when it's full. |
-| `CACHE_MAX_GB` | `50` | Already-uploaded data kept on the Mac for speed |
+| `BACKUP_SIZE_GB` | 1.5 × your data | Size limit Time Machine sees; it deletes the oldest backups when full. Time Machine stores backups in bands of about this size ÷ 3800, and each changed band is uploaded again, so a much larger limit means more uploading. |
+| `MAX_PENDING_GB` | `5` | Time Machine slows down while this much is waiting to upload |
+| `CACHE_MAX_GB` | `5` | Already-uploaded data kept on the Mac for speed |
 | `CACHE_MIN_FREE_GB` | `20` | The cache gives space back when the Mac has less than this free |
-| `TRANSFERS` | `8` | Parallel uploads |
+| `TRANSFERS` | `4` | Parallel uploads |
 | `BWLIMIT` | *(none)* | Optional speed limit, e.g. `20M` for 20 MB/s ([rclone format](https://rclone.org/docs/#bwlimit-bandwidth-spec)) |
+| `SMB_PORT` | `44545` | Local port of the Time Machine share |
+| `DRIVE_FOLDER` | `tm2gdrive-backups` | Google Drive folder (set before the first setup) |
+
+`BACKUP_SIZE_GB` only changes the band size of a new backup; Time Machine
+keeps the band size of an existing one.
 
 ## Troubleshooting
 
@@ -200,34 +208,39 @@ Start with `tm2gdrive status`, then `tm2gdrive logs`. Include both if you
 
 | Problem | Fix |
 |---|---|
-| Time Machine doesn't list "Google Drive Backup" | Give the terminal Full Disk Access ([step 3](#3-give-your-terminal-full-disk-access)), reopen it, and run `tm2gdrive setup` again. It keeps your sign-in and password. |
-| The disk isn't attached | `tm2gdrive logs` shows why. Run `tm2gdrive restart`. |
+| Setup says Time Machine didn't accept the disk | Give the terminal Full Disk Access ([step 3](#3-give-your-terminal-full-disk-access)), reopen it, and run `tm2gdrive setup` again. It keeps your sign-in and password. |
 | "Your Google sign-in has expired" or uploads fail with `invalid_grant` | Run `tm2gdrive reconnect`. If it happens weekly, publish your Google app (setup step 2.5). |
-| Uploads are stuck | Check the internet connection, then look at `tm2gdrive logs`. Unsent data stays safely in the cache. |
-| Time Machine says the disk is full | It deletes old backups automatically. To give it more room, raise `DISK_SIZE_GB` and run `hdiutil resize` (or set up a new disk). |
-| The Mac's own disk is filling up | During the first backup, data waits in the cache until it's uploaded. Leave the Mac online so uploads can catch up; the space is freed as they finish. |
+| A backup failed right after a restart | The Mac's SMB client sometimes needs one retry after the service restarts. Time Machine tries again within the hour. |
+| Uploads are stuck | Check the internet connection, then look at `tm2gdrive logs`. Unsent data stays safely on the Mac. |
+| `status` says files are still open | Time Machine (or macOS) still has them open. They upload once closed, at the latest when the service restarts. |
 
 ## Uninstall
 
 ```bash
 tm2gdrive uninstall           # remove the service and the Time Machine disk
-tm2gdrive uninstall --purge   # also delete the stored disk password and cache from this Mac
+tm2gdrive uninstall --purge   # also delete the sign-in, the backup password and the cache from this Mac
 ```
 
-Your backups stay in Google Drive until you delete the folder.
+Your backups stay in Google Drive until you delete the folder. FUSE-T and
+Samba stay installed (`brew uninstall --cask fuse-t`, `brew uninstall samba`).
+
+## Upgrading from 2.x
+
+macOS 27 no longer accepts disk images as Time Machine disks, which is how
+2.x worked. 3.0 can't use 2.x backups. Uninstall 2.x first:
+
+```bash
+sudo "/Library/Application Support/tm2gdrive/bin/tm2gdrive" uninstall
+```
+
+Then follow [Setup](#setup). 3.0 uses a new Drive folder, so your 2.x
+backup disk stays in the `tm2gdrive` folder until you delete it.
 
 ## Development
 
 - `test/unit-tests.sh` tests the script's logic on any OS.
-- `test/integration-macos.sh` is the real test. On a disposable Mac it:
-  - installs the service, mounts a local folder standing in for Drive, and
-    creates and attaches the encrypted disk
-  - writes data and checks that only encrypted bands reach "Drive"
-  - restarts the service, kills rclone mid-write, and checks the data survives
-  - clears the cache and reads everything back from "Drive"
-  - simulates a new Mac, including a wrong password
-
-  CI runs both, plus ShellCheck, on every push. The script targets the
-  bash 3.2 that ships with macOS.
-
-[Privacy policy](PRIVACY.md) · [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
+- `test/integration-macos.sh` runs the real setup and service on a Mac with
+  a local folder standing in for Google Drive. It writes over SMB like Time
+  Machine, crashes rclone, restarts with an empty cache, and restores with
+  the backup password. CI runs both, plus ShellCheck.
+- [`rclone/`](rclone/) holds the rclone patches and how they're built.

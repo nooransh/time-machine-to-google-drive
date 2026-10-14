@@ -34,103 +34,125 @@ cat > "$CONFIG_FILE" <<'EOF'
 
 DRIVE_FOLDER = 'My Backups'   # trailing comment
 CACHE_MAX_GB=30 # a number with a comment
-VOLUME_NAME="Cloud TM"
+BWLIMIT="08:00,512k 23:00,off"
 NOT_A_SETTING=1
 EOF
-out=$(load_config 2>&1; echo "folder=$DRIVE_FOLDER cache=$CACHE_MAX_GB volume=$VOLUME")
+out=$(load_config 2>&1; echo "folder=$DRIVE_FOLDER cache=$CACHE_MAX_GB")
 load_config 2>/dev/null
 check "quoted values with spaces" eq "$DRIVE_FOLDER" "My Backups"
 check "numbers with trailing comments" eq "$CACHE_MAX_GB" "30"
-check "volume path follows the name" eq "$VOLUME" "/Volumes/Cloud TM"
+check "a bandwidth timetable is accepted" eq "$BWLIMIT" "08:00,512k 23:00,off"
 check "unknown settings are flagged" grep -q "Unknown setting in .*NOT_A_SETTING" <<<"$out"
 
-# shellcheck disable=SC2016  # the $(...) and backticks must reach the file unexpanded
 cd "$WORK" || exit 1
 # shellcheck disable=SC2016  # must reach the file unexpanded
-printf '%s\n' 'DRIVE_FOLDER=$(touch pwned)' 'RCLONE_REMOTE="`touch pwned`"' 'VOLUME_NAME=$(touch pwned)' > "$CONFIG_FILE"
-load_config 2>/dev/null
+printf '%s\n' 'DRIVE_FOLDER=$(touch pwned)' 'BWLIMIT="`touch pwned`"' > "$CONFIG_FILE"
+(load_config) >/dev/null 2>&1
+read_config 2>/dev/null
 cd - >/dev/null || exit 1
 check "the settings file is never executed" test ! -e "$WORK/pwned"
 check "injected text stays plain text" eq "$DRIVE_FOLDER" "\$(touch pwned)"
-check "backticks stay plain text" eq "$RCLONE_REMOTE" "\`touch pwned\`"
+check "backticks stay plain text" eq "$BWLIMIT" "\`touch pwned\`"
+out=$( (load_config) 2>&1 )
+check "a bandwidth limit with shell characters is rejected" grep -q "BWLIMIT .* not a valid" <<<"$out"
 
 echo 'CACHE_MAX_GB=lots' > "$CONFIG_FILE"
 out=$( (load_config) 2>&1 )
 check "non-numeric numbers are rejected" grep -q "CACHE_MAX_GB in .* must be a whole number" <<<"$out"
-echo 'VOLUME_NAME="a/b"' > "$CONFIG_FILE"
+echo 'SMB_PORT=445' > "$CONFIG_FILE"
 out=$( (load_config) 2>&1 )
-check "a disk name with a slash is rejected" grep -q "not a valid disk name" <<<"$out"
+check "a privileged port is rejected" grep -q "SMB_PORT .* between 1024" <<<"$out"
+echo 'DRIVE_FOLDER="../elsewhere"' > "$CONFIG_FILE"
+out=$( (load_config) 2>&1 )
+check "a folder outside Drive's root is rejected" grep -q "not a valid folder name" <<<"$out"
 
 rm -f "$CONFIG_FILE"
-RCLONE_REMOTE="gdrive"; DRIVE_FOLDER="tm2gdrive"; VOLUME_NAME="Google Drive Backup"; CACHE_MAX_GB=50
+DRIVE_FOLDER="tm2gdrive-backups"; CACHE_MAX_GB=5; BWLIMIT=""
 load_config
+BACKUP_SIZE_GB=430
 write_config
-saved_folder="$DRIVE_FOLDER"
-DRIVE_FOLDER="changed"
+DRIVE_FOLDER="changed"; BACKUP_SIZE_GB=0
 load_config
-check "settings survive a write and read" eq "$DRIVE_FOLDER" "$saved_folder"
+check "settings survive a write and read" eq "$DRIVE_FOLDER/$BACKUP_SIZE_GB" "tm2gdrive-backups/430"
 check "the settings file is private" test -z "$(find "$CONFIG_FILE" -perm +044 2>/dev/null || find "$CONFIG_FILE" -perm /044)"
 
-echo "Backup disk size"
+echo "Backup size limit (sets Time Machine's band size)"
 GB=1000000000
-check "twice the Mac's data" eq "$(choose_disk_size $((5000 * GB)) $((400 * GB)))" "800"
-check "at least 200 GB" eq "$(choose_disk_size $((5000 * GB)) $((50 * GB)))" "200"
-check "no more than 90% of Drive's free space" eq "$(choose_disk_size $((500 * GB)) $((400 * GB)))" "450"
-check "no more than 7 TB (Drive's files-per-folder limit)" eq "$(choose_disk_size $((30000 * GB)) $((6000 * GB)))" "7000"
-check "works when Drive's free space is unknown" eq "$(choose_disk_size "" $((400 * GB)))" "800"
+check "1.5 times the Mac's data" eq "$(choose_backup_size $((5000 * GB)) $((400 * GB)))" "600"
+check "at least 100 GB" eq "$(choose_backup_size $((5000 * GB)) $((20 * GB)))" "100"
+check "no more than 90% of Drive's free space" eq "$(choose_backup_size $((500 * GB)) $((400 * GB)))" "450"
+check "works when Drive's free space is unknown" eq "$(choose_backup_size "" $((400 * GB)))" "600"
+
+echo "Samba configuration"
+SMB_PORT=44545; BACKUP_SIZE_GB=430
+write_smb_conf
+check "listens on 127.0.0.1 only" sh -c "grep -q '^  interfaces = 127.0.0.1$' '$SMB_CONF' && grep -q '^  bind interfaces only = yes$' '$SMB_CONF'"
+check "uses the configured port" grep -q "^  smb ports = 44545$" "$SMB_CONF"
+check "no guest access" grep -q "^  map to guest = never$" "$SMB_CONF"
+check "is a Time Machine share with the size limit" sh -c "grep -q 'fruit:time machine = yes' '$SMB_CONF' && grep -q 'fruit:time machine max size = 430G' '$SMB_CONF'"
+check "no stream module (they break on the rclone mount)" sh -c "grep -q '^  vfs objects = catia fruit$' '$SMB_CONF'"
+check "serves the Drive folder" grep -qF "path = $DRIVE_MNT" "$SMB_CONF"
+check "Time Machine logs in as tm2gdrive" grep -qx "$(id -un) = tm2gdrive" "$SAMBA_DIR/usermap"
+check "the configuration is private" test -z "$(find "$SMB_CONF" -perm +044 2>/dev/null || find "$SMB_CONF" -perm /044)"
 
 echo "Time Machine destination lookup"
 tmutil() {
     cat <<'EOF'
 ====================================================
-Name          : Old SSD
+Name          : SSD
 Kind          : Local
-Mount Point   : /Volumes/Old SSD
+Mount Point   : /Volumes/SSD
 ID            : 11111111-1111-1111-1111-111111111111
 ====================================================
-Name          : Google Drive Backup
-Kind          : Local
-Mount Point   : /Volumes/Google Drive Backup
+Name          : tm2gdrive
+Kind          : Network
+URL           : smb://tm2gdrive@127.0.0.1:44545/tm2gdrive
 ID            : 22222222-2222-2222-2222-222222222222
+====================================================
+Name          : tm2gdrive
+Kind          : Local
+Mount Point   : /Volumes/tm2gdrive
+ID            : 33333333-3333-3333-3333-333333333333
 EOF
 }
-VOLUME="/Volumes/Google Drive Backup"
-check "finds our disk among several" eq "$(tm_destination_id)" "22222222-2222-2222-2222-222222222222"
-VOLUME="/Volumes/Old SSD"
-check "matches the exact mount point" eq "$(tm_destination_id)" "11111111-1111-1111-1111-111111111111"
-VOLUME="/Volumes/Google"
+check "finds our share among several" eq "$(tm_destination_id)" "22222222-2222-2222-2222-222222222222"
+SHARE="SSD"
+check "only network destinations count" eq "$(tm_destination_id)" ""
+SHARE="tm2g"
 check "no partial matches" eq "$(tm_destination_id)" ""
+SHARE="tm2gdrive"
 unset -f tmutil
-
-echo "rclone version check"
-fake_rclone() { echo "rclone v$FAKE_V"; echo "- os/version: test"; }
-FAKE_V=1.75.2; check "accepts 1.75" rclone_ok fake_rclone
-FAKE_V=1.65.0; check "accepts 1.65 (first with serve nfs)" rclone_ok fake_rclone
-FAKE_V=1.64.2; check "rejects 1.64" eval '! rclone_ok fake_rclone'
-FAKE_V=2.0.0;  check "accepts 2.x" rclone_ok fake_rclone
-FAKE_V=garbage; check "rejects an unreadable version" eval '! rclone_ok fake_rclone'
 
 echo "Service definition"
 PLIST="$WORK/test.plist"
-chown() { :; }   # tests don't run as root
 write_plist
-unset -f chown
 if command -v plutil >/dev/null 2>&1; then
     check "the service file is a valid plist" plutil -lint -s "$PLIST"
 elif command -v xmllint >/dev/null 2>&1; then
     check "the service file is valid XML" xmllint --noout "$PLIST"
 fi
-check "it runs the root-owned copy" grep -qF "<string>$BIN_DIR/tm2gdrive</string>" "$PLIST"
+check "it runs the installed copy" grep -qF "<string>$BIN_DIR/tm2gdrive</string>" "$PLIST"
 check "it restarts if it stops" grep -q "<key>KeepAlive</key>" "$PLIST"
-check "it has time to detach the disk at shutdown" grep -q "<integer>120</integer>" "$PLIST"
+check "it doesn't run as root (no UserName, it's a LaunchAgent)" sh -c "! grep -q '<key>UserName</key>' '$PLIST'"
 
 echo "Upload status"
-rc() { echo '{"diskCache": {"uploadsInProgress": 2, "uploadsQueued": 5, "bytesUsed": 1}}'; }
-check "adds in-progress and queued uploads" eq "$(pending_uploads)" "7"
-rc() { echo '{"diskCache": {"uploadsInProgress": 0, "uploadsQueued": 0}}'; }
-check "zero when everything is uploaded" eq "$(pending_uploads)" "0"
+rc() { echo '{"diskCache": {"dirtyFiles": 9, "dirtyBytes": 5, "pendingFiles": 7, "pendingBytes": 3000000000}}'; }
+check "pending files, bytes and files still open" eq "$(pending_uploads)" "7 3000000000 2"
+rc() { echo '{"diskCache": {"dirtyFiles": 0, "dirtyBytes": 0, "pendingFiles": 0, "pendingBytes": 0}}'; }
+check "zero when everything is uploaded" eq "$(pending_uploads)" "0 0 0"
+rc() { echo '{"diskCache": {"uploadsQueued": 0}}'; }
+check "empty with an unpatched rclone" eq "$(pending_uploads)" ""
 rc() { return 1; }
 check "empty when the service can't be asked" eq "$(pending_uploads)" ""
+
+echo "Patched rclone check"
+RCLONE="$WORK/fake-rclone"
+printf '#!/bin/sh\necho "      --vfs-cache-max-pending SizeSuffix   Pause writes"\n' > "$RCLONE"; chmod +x "$RCLONE"
+check "accepts rclone with tm2gdrive's patches" rclone_patched
+printf '#!/bin/sh\necho "      --vfs-cache-max-size SizeSuffix"\n' > "$RCLONE"
+check "rejects stock rclone" eval '! rclone_patched'
+rm -f "$RCLONE"
+check "rejects a missing rclone" eval '! rclone_patched'
 
 echo
 echo "$PASS passed, $FAIL failed"

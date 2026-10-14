@@ -38,7 +38,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: Install rclone
-        run: brew install rclone
-      - name: Set up, back up, crash, restore
+      - name: Install FUSE-T and Samba
+        run: |
+          brew install --cask macos-fuse-t/cask/fuse-t
+          brew install samba
+      - name: Set up, back up over SMB, crash, restore
         run: /bin/bash test/integration-macos.sh

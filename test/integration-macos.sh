@@ -2,30 +2,32 @@
 #
 # End-to-end test on a real Mac (used by CI).
 #
-# Runs the real tm2gdrive setup, background service, NFS mount, encrypted disk
-# image and Time Machine destination. A local folder stands in for Google
-# Drive. Then it writes data to the backup disk and checks that it arrives in
-# "Drive" encrypted, survives restarts and an rclone crash, can be read back
-# with an empty cache, and can be opened again as if on a new Mac.
+# Runs the real tm2gdrive setup and background service: rclone (with
+# tm2gdrive's patches) on FUSE-T, and Samba as the Time Machine share. A local
+# folder stands in for Google Drive. It writes to the share over SMB, like
+# Time Machine does, and checks that the data reaches "Drive" encrypted,
+# survives an rclone crash and a restart with an empty cache, and opens again
+# with the backup password as if on a new Mac. Time Machine itself can't run
+# on CI machines, so the Time Machine step is skipped.
 #
-# WARNING: installs a system service and changes Time Machine settings. It
-# only runs on disposable CI machines, or with TM2GDRIVE_DESTRUCTIVE_OK=1.
+# Everything lives in a temporary folder, but the background service uses
+# tm2gdrive's real LaunchAgent label, so this would replace a real install.
+# It only runs on CI machines, or with TM2GDRIVE_DESTRUCTIVE_OK=1.
 #
-# Run as a normal user with sudo rights: bash test/integration-macos.sh
+# Needs FUSE-T and Homebrew's Samba. Uses $TM2GDRIVE_RCLONE if set; otherwise
+# setup downloads the patched rclone like it does for users.
 #
-# shellcheck disable=SC2016,SC2034,SC2001,SC2009  # checks are passed to eval on purpose
+# shellcheck disable=SC2016  # checks are passed to eval on purpose
 set -u -o pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 TOOL="$HERE/../tm2gdrive"
-VOLUME="/Volumes/Google Drive Backup"
-LOG=/Library/Logs/tm2gdrive.log
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "macOS only" >&2; exit 1; }
-[[ $EUID -ne 0 ]] || { echo "Run as a normal user with sudo rights, not as root." >&2; exit 1; }
+[[ $EUID -ne 0 ]] || { echo "Run as a normal user, not as root." >&2; exit 1; }
 if [[ "${CI:-}" != "true" && "${TM2GDRIVE_DESTRUCTIVE_OK:-}" != "1" ]]; then
-    echo "Refusing to run: this installs a system service and changes Time Machine settings." >&2
-    echo "It is meant for disposable CI machines." >&2
+    echo "Refusing to run: this replaces tm2gdrive's background service, if installed." >&2
+    echo "It is meant for CI machines (or set TM2GDRIVE_DESTRUCTIVE_OK=1)." >&2
     exit 1
 fi
 
@@ -37,116 +39,104 @@ check() {
     if "$@"; then PASS=$((PASS + 1)); echo "  ok    $desc"; else FAIL=$((FAIL + 1)); echo "  FAIL  $desc"; fi
 }
 step() { printf '\n=== %s  (%s)\n' "$*" "$(date '+%H:%M:%S')"; }
-
-diagnostics() {
-    echo "--- service log";      sudo tail -n 100 "$LOG" 2>/dev/null
-    echo "--- mounts";           mount
-    echo "--- disk images";      hdiutil info 2>&1 | tail -n 30
-    echo "--- processes";        ps axww -o pid,ppid,stat,etime,command | grep -E "rclone|hdiutil|tm2gdrive|mount|diskimage" | grep -v grep
-    echo "--- service";          sudo launchctl print system/io.github.nooranshdhaka.tm2gdrive 2>&1 | head -n 25
-}
-
-# A hang must not burn CI time silently: after 20 minutes, show what is stuck and stop.
-( sleep 1200; echo; echo "=== WATCHDOG: the test hung. State of the system:"; diagnostics; kill -TERM -$$ 2>/dev/null; kill -TERM $$ ) &
-WATCHDOG=$!
-wait_until() {   # wait_until <seconds> <command...>
-    local t="$1" _
-    shift
-    for _ in $(seq 1 "$t"); do "$@" && return 0; sleep 1; done
+wait_until() {   # wait_until <seconds> <shell condition>
+    local _
+    for _ in $(seq 1 "$1"); do eval "$2" && return 0; sleep 1; done
     return 1
 }
-mounted()   { mount | grep -qF " on $1 ("; }
-uploaded()  { sudo "$TOOL" status 2>/dev/null | grep -q "Everything is uploaded"; }
-checksums() { (cd "$VOLUME/data" && shasum -a 256 ./* ) 2>/dev/null; }
 
-DRIVE=$(mktemp -d /private/tmp/tm2gdrive-fake-drive.XXXXXX)
-CONF=$(mktemp /private/tmp/tm2gdrive-rclone.XXXXXX)
-printf '[gdrive]\ntype = local\n' > "$CONF"
-export TM2GDRIVE_RCLONE_CONF="$CONF"
-export TM2GDRIVE_DRIVE_FOLDER="$DRIVE"
-export TM2GDRIVE_DISK_PASSWORD="integration-test-password"
-export TM2GDRIVE_DISK_SIZE_GB=4
-export TM2GDRIVE_ASSUME_YES=1
-export TM2GDRIVE_SKIP_FDA_CHECK=1   # CI machines grant root what Full Disk Access would
-IMAGE="$DRIVE/TimeMachine.sparsebundle"
+# Short paths: Samba's sockets live under the state folder.
+W=$(mktemp -d /private/tmp/tm2g-it.XXXX)
+mkdir -p "$W/drive-standin" "$W/smb"
+printf '[gdrive]\ntype = alias\nremote = %s/drive-standin\n' "$W" > "$W/remote.conf"
+export TM2GDRIVE_STATE_DIR="$W/state" TM2GDRIVE_CACHE_DIR="$W/cache" TM2GDRIVE_LOG="$W/tm2gdrive.log"
+export TM2GDRIVE_PLIST="$W/agent.plist" TM2GDRIVE_DRIVE_REMOTE_CONF="$W/remote.conf"
+export TM2GDRIVE_SKIP_TIME_MACHINE=1 TM2GDRIVE_ASSUME_YES=1 TM2GDRIVE_BACKUP_PASSWORD="correct horse battery staple"
+MARKER="TM2GDRIVE-PLAINTEXT-$$-MARKER"
 
-finish() {
-    kill "$WATCHDOG" 2>/dev/null
-    if [[ $FAIL -gt 0 ]]; then
-        echo; echo "=== diagnostics"; diagnostics
-    fi
-    sudo "$TOOL" uninstall --purge >/dev/null 2>&1
-    echo; echo "$PASS passed, $FAIL failed"
+smb_mount() {   # macOS's SMB client may fail once right after Samba restarts
+    local pw _
+    pw=$(cat "$TM2GDRIVE_STATE_DIR/smb-password")
+    for _ in 1 2 3; do
+        mount_smbfs "//tm2gdrive:$pw@127.0.0.1:44545/tm2gdrive" "$W/smb" 2>/dev/null && return 0
+        sleep 2
+    done
+    return 1
 }
-trap finish EXIT
+smb_unmount() { umount "$W/smb" 2>/dev/null || diskutil unmount force "$W/smb" >/dev/null 2>&1; }
+uploaded() { local out; out=$("$TOOL" status 2>/dev/null); [[ "$out" == *"Everything is uploaded"* ]]; }
 
-step "Setup"
-"$TOOL" setup
-setup_rc=$?
-check "setup succeeds" test $setup_rc -eq 0
-[[ $setup_rc -eq 0 ]] || { diagnostics; exit 1; }
-check "the background service is running" sudo launchctl print system/io.github.nooranshdhaka.tm2gdrive
-check "Google Drive (the stand-in) is mounted over NFS" eval 'mount | grep -q " on /private/var/tm2gdrive/drive (nfs"'
-check "the backup disk is attached" mounted "$VOLUME"
-check "the backup disk is encrypted" eval '[[ "$(hdiutil info)" == *"image-encrypted : TRUE"* ]]'
-check "the backup disk is APFS" eval 'diskutil info "$VOLUME" | grep -q "APFS"'
-check "ownership is enabled (Time Machine needs it)" eval 'diskutil info "$VOLUME" | grep -qE "Owners: +Enabled"'
-check "Time Machine has the disk as a destination" eval 'tmutil destinationinfo | grep -qF "Mount Point   : $VOLUME"'
-check "the service runs root-owned copies of its programs" eval '[[ "$(sudo stat -f %Su "/Library/Application Support/tm2gdrive/bin/rclone")" == root ]]'
-check "the disk password is private" eval '[[ "$(sudo stat -f %Lp "/Library/Application Support/tm2gdrive/disk-password")" == 600 ]]'
+cleanup() {
+    smb_unmount
+    "$TOOL" uninstall --purge >/dev/null 2>&1
+    rm -rf "$W"
+}
+trap cleanup EXIT
 
-step "Writing to the backup disk reaches Drive, encrypted"
-sudo mkdir -p "$VOLUME/data"
-sudo dd if=/dev/urandom of="$VOLUME/data/random.bin" bs=1m count=300 2>/dev/null
-printf 'PLAINTEXT-MARKER-%s\n' "$RANDOM$RANDOM" | sudo tee "$VOLUME/data/marker.txt" >/dev/null
-marker=$(cat "$VOLUME/data/marker.txt")
-sync
-before=$(checksums)
-check "files were written" test -n "$before"
-check "all uploads finish" wait_until 300 uploaded
-check "the backup disk is a sparse bundle in Drive" sudo test -f "$IMAGE/Info.plist"
-bands=$(sudo find "$IMAGE/bands" -type f | wc -l | tr -d ' ')
-size_mb=$(sudo du -sm "$IMAGE" | awk '{print $1}')
-echo "        $bands band files, $size_mb MB in Drive"
-check "the data is in Drive" test "$size_mb" -ge 300
-check "bands are 16 MiB or smaller" eval '[[ -z "$(sudo find "$IMAGE/bands" -type f -size +16384k)" ]]'
-check "Drive only holds encrypted data" eval '! sudo grep -rqF "$marker" "$DRIVE"'
-out=$(sudo "$TOOL" status)
-check "status reports a healthy setup" test $? -eq 0
-echo "$out" | sed 's/^/        /'
+step "setup"
+"$TOOL" setup; rc=$?
+check "setup succeeds" test $rc -eq 0
+check "the service is running" launchctl print "gui/$(id -u)/io.github.nooranshdhaka.tm2gdrive"
+check "the share is on 127.0.0.1 only" sh -c "lsof -nP -iTCP:44545 -sTCP:LISTEN | grep -q '127.0.0.1:44545' && ! lsof -nP -iTCP:44545 -sTCP:LISTEN | grep -q '\*:44545'"
+check "status is healthy" "$TOOL" status
+check "Samba runs as the user, not root" sh -c "ps -o user= -p \$(pgrep -f 'samba-dot-org-smbd.*$W' | head -1) | grep -qx '$(id -un)'"
 
-step "Restart"
-sudo "$TOOL" restart
-check "the disk comes back after a restart" wait_until 120 mounted "$VOLUME"
-check "the data is intact after a restart" eval '[[ "$(checksums)" == "$before" ]]'
+crash_rclone() { pkill -9 -f "rclone.* mount tm2gdrive: $W/state/drive"; }
 
-step "rclone crash while the disk is in use"
-sudo pkill -9 -f "rclone serve nfs"
-sudo dd if=/dev/urandom of="$VOLUME/data/after-crash.bin" bs=1m count=20 2>/dev/null
-check "writing still works after rclone is restarted" test -s "$VOLUME/data/after-crash.bin"
-check "the service logged the restart" eval 'sudo grep -q "restarting it" "$LOG"'
-after_crash=$(checksums)
-check "all uploads finish after the crash" wait_until 300 uploaded
+step "write over SMB like Time Machine"
+check "the share mounts" smb_mount
+{ head -c 5000000 /dev/urandom; echo "$MARKER"; head -c 5000000 /dev/urandom; } > "$W/source.bin"
+cp -X "$W/source.bin" "$W/smb/backup.bin"
+mkdir -p "$W/smb/bundle.sparsebundle/bands" && head -c 2000000 /dev/urandom > "$W/smb/bundle.sparsebundle/bands/0"
+mv "$W/smb/bundle.sparsebundle" "$W/smb/renamed.sparsebundle"
+check "a renamed folder keeps its files" test -f "$W/smb/renamed.sparsebundle/bands/0"
+smb_unmount   # the SMB client keeps files open; open files aren't uploaded
+check "everything uploads" wait_until 120 uploaded
+check "\"Drive\" holds files" test -n "$(find "$W/drive-standin" -type f)"
+check "\"Drive\" holds no plaintext names" test -z "$(find "$W/drive-standin" -name 'backup.bin' -o -name '*.sparsebundle')"
+check "\"Drive\" holds no plaintext data" sh -c "! grep -rqa '$MARKER' '$W/drive-standin'"
 
-step "Empty cache: everything is read back from Drive"
-sudo "$TOOL" stop
-check "stopping detaches the disk" eval '! mounted "$VOLUME"'
-check "stopping unmounts Drive" eval '! mount | grep -q "/private/var/tm2gdrive/drive"'
-sudo rm -rf /Library/Caches/tm2gdrive
-sudo "$TOOL" start
-check "the disk attaches with an empty cache" wait_until 180 mounted "$VOLUME"
-check "the data read back from Drive is intact" eval '[[ "$(checksums)" == "$after_crash" ]]'
+step "rclone crash"
+crash_rclone
+check "the service brings the share back" wait_until 90 '"$TOOL" status >/dev/null 2>&1'
+check "the share mounts again" smb_mount
+check "the data is intact" cmp -s "$W/source.bin" "$W/smb/backup.bin"
+cp -X "$W/source.bin" "$W/smb/late.bin"
+smb_unmount
+crash_rclone   # before late.bin is uploaded
+check "the service comes back" wait_until 90 '"$TOOL" status >/dev/null 2>&1'
+check "files closed before the crash still upload" wait_until 120 uploaded
 
-step "A new Mac: set up again from the backup in Drive"
-sudo "$TOOL" uninstall --purge
-check "uninstall removes the Time Machine destination" eval '! tmutil destinationinfo 2>/dev/null | grep -qF "$VOLUME"'
-check "uninstall detaches the disk" eval '! mounted "$VOLUME"'
-check "uninstall keeps the backup in Drive" sudo test -f "$IMAGE/Info.plist"
-TM2GDRIVE_DISK_PASSWORD="wrong-password" "$TOOL" setup > /tmp/tm2gdrive-wrongpw.txt 2>&1
-check "a wrong password is refused" grep -q "didn't open the backup disk" /tmp/tm2gdrive-wrongpw.txt
-sudo "$TOOL" uninstall --purge >/dev/null 2>&1
-"$TOOL" setup
-check "setup finds the existing backup" mounted "$VOLUME"
-check "the old data is all there" eval '[[ "$(checksums)" == "$after_crash" ]]'
+step "restart with an empty cache (data must come from \"Drive\")"
+"$TOOL" stop >/dev/null
+rm -rf "$W/cache"
+"$TOOL" start >/dev/null
+check "the share comes back" wait_until 90 '"$TOOL" status >/dev/null 2>&1'
+check "the share mounts" smb_mount
+check "the data is intact" cmp -s "$W/source.bin" "$W/smb/backup.bin"
+check "the file closed before the crash is intact" cmp -s "$W/source.bin" "$W/smb/late.bin"
+smb_unmount
 
-[[ $FAIL -eq 0 ]]
+step "a new Mac: the backup password restores access"
+"$TOOL" uninstall --purge >/dev/null
+TM2GDRIVE_BACKUP_PASSWORD="wrong password" "$TOOL" setup > "$W/wrong.log" 2>&1; rc=$?
+check "a wrong password is refused" sh -c "test $rc -ne 0 && grep -q \"doesn't decrypt\" '$W/wrong.log'"
+"$TOOL" uninstall --purge >/dev/null
+"$TOOL" setup >/dev/null 2>&1; rc=$?
+check "the right password is accepted" test $rc -eq 0
+check "the share mounts" smb_mount
+check "the backups are there" cmp -s "$W/source.bin" "$W/smb/backup.bin"
+smb_unmount
+
+step "uninstall"
+"$TOOL" uninstall --purge >/dev/null
+check "the service is gone" sh -c "! launchctl print gui/$(id -u)/io.github.nooranshdhaka.tm2gdrive >/dev/null 2>&1"
+check "nothing is left listening" sh -c "! lsof -nP -iTCP:44545 -sTCP:LISTEN >/dev/null"
+check "the backups stay in \"Drive\"" test -n "$(ls "$W/drive-standin")"
+
+echo
+echo "$PASS passed, $FAIL failed"
+if [[ $FAIL -ne 0 ]]; then
+    echo "--- service log"; tail -40 "$W/tm2gdrive.log" 2>/dev/null
+    exit 1
+fi
