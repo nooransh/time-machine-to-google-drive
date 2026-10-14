@@ -81,7 +81,13 @@ check "the share is on 127.0.0.1 only" sh -c "lsof -nP -iTCP:44545 -sTCP:LISTEN 
 check "status is healthy" "$TOOL" status
 check "Samba runs as the user, not root" sh -c "ps -o user= -p \$(pgrep -f 'samba-dot-org-smbd.*$W' | head -1) | grep -qx '$(id -un)'"
 
-crash_rclone() { pkill -9 -f "rclone.* mount tm2gdrive: $W/state/drive"; }
+rclone_pid() { pgrep -f "rclone.* mount tm2gdrive: $W/state/drive" | head -1; }
+crash_rclone() {   # kill rclone, then wait until the service has started a new one
+    local old
+    old=$(rclone_pid)
+    kill -9 "$old"
+    wait_until 90 "[[ -n \"\$(rclone_pid)\" && \"\$(rclone_pid)\" != $old ]] && \"\$TOOL\" status >/dev/null 2>&1"
+}
 
 step "write over SMB like Time Machine"
 check "the share mounts" smb_mount
@@ -97,14 +103,13 @@ check "\"Drive\" holds no plaintext names" test -z "$(find "$W/drive-standin" -n
 check "\"Drive\" holds no plaintext data" sh -c "! grep -rqa '$MARKER' '$W/drive-standin'"
 
 step "rclone crash"
-crash_rclone
-check "the service brings the share back" wait_until 90 '"$TOOL" status >/dev/null 2>&1'
+check "the service restarts rclone and the share" crash_rclone
+check "nothing was written to the bare mount point" test -z "$(ls -d "$W"/state/stray-files-* 2>/dev/null)"
 check "the share mounts again" smb_mount
 check "the data is intact" cmp -s "$W/source.bin" "$W/smb/backup.bin"
 cp -X "$W/source.bin" "$W/smb/late.bin"
 smb_unmount
-crash_rclone   # before late.bin is uploaded
-check "the service comes back" wait_until 90 '"$TOOL" status >/dev/null 2>&1'
+check "the service comes back after a crash before late.bin is uploaded" crash_rclone
 check "files closed before the crash still upload" wait_until 120 uploaded
 
 step "restart with an empty cache (data must come from \"Drive\")"

@@ -215,6 +215,9 @@ rc() {
     "$RCLONE" rc --unix-socket "$RC_SOCKET" "$@" 2>/dev/null
 }
 
+# A crashed rclone can leave its mount listed for a moment; ask rclone itself.
+drive_alive() { drive_mounted && rc rc/noop >/dev/null; }
+
 json_number() {   # json_number <key> : reads JSON on stdin
     grep -oE "\"$1\":[[:space:]]*[0-9]+" | head -1 | grep -oE '[0-9]+$'
 }
@@ -352,6 +355,17 @@ start_rclone() {
     )
     [[ -n "$BWLIMIT" ]] && args+=(--bwlimit "$BWLIMIT")
     mkdir -p "$DRIVE_MNT" "$CACHE_DIR"
+    # Nothing may land in the bare mount point (e.g. Samba writing just after
+    # a crash): it would hide under the mount, and rclone refuses to mount
+    # over a non-empty folder. Keep it read-only, and move strays aside.
+    if [[ -n "$(ls -A "$DRIVE_MNT" 2>/dev/null)" ]]; then
+        local stray
+        stray="$STATE_DIR/stray-files-$(date +%Y%m%d-%H%M%S)"
+        chmod 700 "$DRIVE_MNT"
+        mv "$DRIVE_MNT" "$stray" && mkdir -p "$DRIVE_MNT" \
+            && log "moved files found in the empty mount point to $stray"
+    fi
+    chmod 500 "$DRIVE_MNT"
     rm -f "$RC_SOCKET"
     "$RCLONE" "${args[@]}" &
     RCLONE_PID=$!
@@ -436,7 +450,7 @@ cmd_daemon() {
             [[ -n "$SMBD_PID" ]] && log "Samba stopped unexpectedly; restarting"
             start_samba || { sleep 10 & wait $!; continue; }
         fi
-        sleep 10 & wait $!
+        sleep 3 & wait $!
     done
 }
 
@@ -798,7 +812,7 @@ cmd_status() {
     local problems=0 pending free
 
     if agent_loaded; then ok "Background service is running"; else err "Background service is not running (start it: $PROG start)"; problems=1; fi
-    if drive_mounted; then ok "Encrypted Google Drive folder \"$DRIVE_FOLDER\" is mounted"; else err "Google Drive is not mounted (see: $PROG logs)"; problems=1; fi
+    if drive_alive; then ok "Encrypted Google Drive folder \"$DRIVE_FOLDER\" is mounted"; else err "Google Drive is not mounted (see: $PROG logs)"; problems=1; fi
     if smb_listening; then ok "Time Machine share is up (127.0.0.1:$SMB_PORT)"; else err "Time Machine share is down (see: $PROG logs)"; problems=1; fi
     if [[ -n "$(tm_destination_id)" ]]; then
         ok "Time Machine backs up to \"$SHARE\""
